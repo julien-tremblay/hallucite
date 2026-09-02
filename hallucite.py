@@ -8,8 +8,9 @@ So this is a $0, no-LLM, network-only check that resolves every reference agains
 registries (Crossref for DOIs/titles, arXiv for eprints) and classifies it.
 
 Classes (most→least dangerous):
-  FABRICATED  a DOI that 404s, or an arXiv id with no record        -> hard
+  FABRICATED  identifier resolves nowhere AND no record matches the title -> hard
   MISMATCH    DOI/arXiv resolves, but to a DIFFERENT title          -> hard
+  BAD-DOI     the paper is real, the identifier resolves nowhere    -> soft
   SUSPECT     title-only ref with no close Crossref match           -> soft (may be a book/thesis/non-indexed venue)
   OK          resolved and title matches                            -> pass
   UNCHECKABLE no DOI / arXiv / usable title, or registry unreachable-> soft; unreachable also fails --gate
@@ -129,13 +130,40 @@ def norm(s):
     return "".join(c if c.isalnum() else " " for c in s).split()
 
 
+def _ordered_coverage(ta, tb):
+    """Fraction of the shorter token list found in the longer one IN ORDER."""
+    short, lng = (ta, tb) if len(ta) <= len(tb) else (tb, ta)
+    if not short:
+        return 0.0
+    sm = difflib.SequenceMatcher(None, short, lng)
+    return sum(b.size for b in sm.get_matching_blocks()) / len(short)
+
+
+# Containment can establish "plausibly the same work"; it can never establish identity, so
+# its score is capped below the 0.90 bar that certifies one. Without the cap, a title that
+# merely BEGINS with the cited one scores 1.00 -- which is how "Attention Is All You Need"
+# was certified against "Attention Is All You Need: An Analysis Of The Valuation Of Art".
+_CONTAINMENT_CEILING = 0.85
+
+
 def title_match(a, b):
+    """0..1 similarity of two titles: a close string, OR one contained in the other in order.
+
+    The second term was unordered token overlap, which discards word order entirely, so
+    "Learning to Rank for Information Retrieval" and "Information Retrieval for Learning to
+    Rank" -- different papers -- scored 1.00, as did "Attention Is All You Need" against
+    "Is Attention All You Need?". That is how a wrong Crossref record got certified as the
+    right one. Ordered containment rejects both (0.50, 0.88).
+
+    The term cannot simply be dropped: a real paper cited without the registry's long
+    subtitle falls to 0.52 on the string ratio alone and would be reported MISMATCH. So
+    containment stays, capped, to rescue that without certifying anything.
+    """
     ta, tb = norm(a), norm(b)
     if not ta or not tb:
         return 0.0
     seq = difflib.SequenceMatcher(None, " ".join(ta), " ".join(tb)).ratio()
-    setj = len(set(ta) & set(tb)) / len(set(ta) | set(tb))
-    return max(seq, setj)  # either a close string OR strong token overlap counts
+    return max(seq, _CONTAINMENT_CEILING * _ordered_coverage(ta, tb))
 
 
 # ---- reference extraction --------------------------------------------------
@@ -366,10 +394,7 @@ def check_doi(doi, claimed_title):
             )
         except urllib.error.HTTPError as e2:
             if e2.code == 404:
-                return (
-                    "FABRICATED",
-                    f"DOI {doi} does not resolve at doi.org (all registration agencies)",
-                )
+                return _unresolvable(doi, claimed_title)
             return "UNCHECKABLE", NO_ORACLE + f"doi.org HTTP {e2.code}"
         except Exception as e2:  # noqa: BLE001
             return "UNCHECKABLE", NO_ORACLE + f"doi.org {type(e2).__name__}"
@@ -442,32 +467,76 @@ def check_arxiv(aid, claimed_title):
     )
 
 
-def check_title(title):
+def _title_lookup(title):
+    """Best Crossref match for a title: (score, found_title), or (None, reason) if the
+    registry could not answer. Split out so that a definitively dead DOI can consult it."""
     try:
         q = urllib.parse.quote(title)
         body, _ = _get(
-            f"https://api.crossref.org/works?query.bibliographic={q}&rows=3&mailto={MAILTO}"
+            # rows=3 was too few to be a fair test: for "Attention Is All You Need" the
+            # three exact Crossref records rank 8th, 9th and 10th, so the lookup saw only
+            # near-misses and matched a DIFFERENT paper.
+            f"https://api.crossref.org/works?query.bibliographic={q}&rows=10&mailto={MAILTO}"
         )
     except urllib.error.HTTPError as e:
-        return "UNCHECKABLE", NO_ORACLE + f"Crossref HTTP {e.code}"
+        return None, NO_ORACLE + f"Crossref HTTP {e.code}"
     except Exception as e:  # noqa: BLE001
-        return "UNCHECKABLE", NO_ORACLE + f"Crossref {type(e).__name__}"
+        return None, NO_ORACLE + f"Crossref {type(e).__name__}"
     try:
         _j = json.loads(body)
     except ValueError:
-        return "UNCHECKABLE", NO_ORACLE + "Crossref returned non-JSON (error page?)"
-    items = _j.get("message", {}).get("items", [])
-    best = max(
-        (title_match(title, (it.get("title") or [""])[0]) for it in items), default=0.0
-    )
+        return None, NO_ORACLE + "Crossref returned non-JSON (error page?)"
+    best, found = 0.0, ""
+    for it in _j.get("message", {}).get("items", []):
+        cand = (it.get("title") or [""])[0]
+        r = title_match(title, cand)
+        if r > best:
+            best, found = r, cand
+    return best, found
+
+
+def check_title(title):
+    best, found = _title_lookup(title)
+    if best is None:
+        return "UNCHECKABLE", found
     return (
         ("OK", f"title found in Crossref (match {best:.2f})")
         if best >= 0.75
         else (
             "SUSPECT",
-            f"no close Crossref match (best {best:.2f}) — verify by hand (book/thesis/non-indexed?)",
+            f"no close Crossref match (best {best:.2f}) - verify by hand (book/thesis/non-indexed?)",
         )
     )
+
+
+def _unresolvable(doi, claimed_title):
+    """A DOI that resolves nowhere. Is the REFERENCE invented, or only the identifier?
+
+    ACM's `10.5555/*` proceedings range is the standard case: `10.5555/3295222.3295349` is
+    "Attention Is All You Need", it 404s at doi.org, and a flat FABRICATED verdict therefore
+    accused the most-cited paper in modern machine learning of not existing. Publishers also
+    mistype, retire and never register DOIs for work that plainly exists, and a reader who
+    is told their real reference is fake stops believing the tool on the one that is.
+
+    Consulting the title here is NOT the fallback verify() refuses. That refusal covers an
+    oracle that failed to answer; this is an oracle that answered definitively. The bar is
+    0.90 rather than the 0.60 used elsewhere because a fabricated reference almost always
+    carries a plausible title, and a loose bar would launder exactly what this tool exists
+    to catch.
+    """
+    dead = f"DOI {doi} does not resolve at doi.org (all registration agencies)"
+    if not claimed_title:
+        return "FABRICATED", dead
+    best, found = _title_lookup(claimed_title)
+    if best is None:
+        # Half a check is not a verdict: the DOI is definitively dead, but with no way to
+        # ask about the title we cannot tell a wrong identifier from an invented paper.
+        return "UNCHECKABLE", f"{found} -- {doi} resolves nowhere, title unverified"
+    if best >= 0.90:
+        return "BAD-DOI", (f"the paper is real (Crossref match {best:.2f}: "
+                           f"'{found[:50]}') but DOI {doi} resolves nowhere: wrong, "
+                           f"retired or never-registered identifier")
+    return "FABRICATED", f"{dead}, and no Crossref record matches the title (best {best:.2f})"
 
 
 def verify(ref):
@@ -598,6 +667,18 @@ def selftest():
             },
             "MISMATCH",
         ),
+        # The most-cited paper in modern machine learning, carrying ACM's 10.5555 DL
+        # identifier, which resolves nowhere. A flat FABRICATED here accused it of not
+        # existing, which is the one verdict this tool must never get wrong.
+        (
+            {
+                "doi": "10.5555/3295222.3295349",
+                "arxiv": "",
+                "title": "Attention Is All You Need",
+                "key": "t6",
+            },
+            "BAD-DOI",
+        ),
     ]
     # A case whose registry could not be REACHED is SKIPPED, not failed. The distinction is
     # the whole point: "the tool gave the wrong answer" and "the oracle was rate-limited" are
@@ -699,7 +780,7 @@ def main():
             cls, why = verify(ref)
             if cls in ("FABRICATED", "MISMATCH"):
                 hard += 1
-            elif cls in ("SUSPECT", "UNCHECKABLE"):
+            elif cls in ("SUSPECT", "UNCHECKABLE", "BAD-DOI"):
                 soft += 1
                 if NO_ORACLE in why:
                     degraded += 1
@@ -708,6 +789,7 @@ def main():
                 "FABRICATED": "FABR",
                 "MISMATCH": "MISM",
                 "SUSPECT": "SUSP",
+                "BAD-DOI": "BDOI",
                 "UNCHECKABLE": "??? ",
             }[cls]
             print(f"  [{icon}] {ref['key'][:40]:40s} {why}")

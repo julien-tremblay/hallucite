@@ -200,5 +200,73 @@ check("`et al.` is still not mistaken for a title",
 check("punctuation is still not mistaken for a title",
       H.parse_bibitem(r"\bibitem{k} A., ``--,'' 2001.")[0]["title"] == "")
 
+
+# --- round 3: a dead identifier is not a dead reference -------------------------------
+
+# 16. Unordered token overlap discarded word ORDER, so different papers scored 1.00:
+#     "Learning to Rank for Information Retrieval" vs "Information Retrieval for Learning
+#     to Rank", and "Attention Is All You Need" vs "Is Attention All You Need?". That is how
+#     a wrong Crossref record was certified as the right one.
+check("word order is not ignored",
+      H.title_match("Learning to Rank for Information Retrieval",
+                    "Information Retrieval for Learning to Rank") < 0.60,
+      f"got {H.title_match('Learning to Rank for Information Retrieval', 'Information Retrieval for Learning to Rank'):.2f}")
+
+# 17. Containment must RESCUE a real paper cited without the registry's long subtitle (the
+#     string ratio alone puts it at 0.52 and would report MISMATCH) without CERTIFYING
+#     anything: a title that merely begins with the cited one, such as the art-valuation
+#     paper that puns on Vaswani, must stay below the 0.90 identity bar.
+check("a long added subtitle is still a match",
+      H.title_match("Deep Residual Learning",
+                    "Deep Residual Learning: a very long supplementary subtitle here") >= 0.60)
+for other in ["Attention Is All You Need: An Analysis Of The Valuation Of Art",
+              "Is Attention All You Need?"]:
+    got = H.title_match("Attention Is All You Need", other)
+    check(f"containment cannot certify identity ({other[:28]!r})", got < 0.90, f"got {got:.2f}")
+check("an exact title still certifies",
+      H.title_match("Attention Is All You Need", "Attention Is All You Need") >= 0.90)
+
+# 18. A DOI that resolves nowhere is not proof the PAPER is invented. ACM's 10.5555 range is
+#     the standard case: 10.5555/3295222.3295349 is "Attention Is All You Need" and it 404s,
+#     so a flat FABRICATED accused the most-cited paper in modern machine learning of not
+#     existing. Consulting the title here is not the fallback verify() refuses: that covers
+#     an oracle that FAILED to answer, this one answered definitively.
+import json as _j2
+_real_get = H._get
+
+
+def _mock(doi_404=True, best_title=None, title_oracle_ok=True):
+    def g(url, accept="application/json"):
+        if "query.bibliographic" in url:
+            if not title_oracle_ok:
+                raise urllib_error.HTTPError(url, 503, "down", {}, None)
+            items = [{"title": [best_title]}] if best_title else []
+            return _j2.dumps({"message": {"items": items}}), 200
+        raise urllib_error.HTTPError(url, 404, "Not Found", {}, None)
+    return g
+
+
+import urllib.error as urllib_error  # noqa: E402
+
+REF = {"doi": "10.5555/3295222.3295349", "arxiv": "", "year": "",
+       "title": "Attention Is All You Need", "key": "acm"}
+H._get = _mock(best_title="Attention Is All You Need")
+cls, why = H.verify(dict(REF))
+check("a real paper with a dead DOI is BAD-DOI, not FABRICATED", cls == "BAD-DOI", f"got {cls}: {why}")
+H._get = _mock(best_title="Something Else Entirely About Penguins")
+cls, why = H.verify(dict(REF))
+check("a dead DOI whose title matches nothing is still FABRICATED", cls == "FABRICATED", f"got {cls}")
+H._get = _mock(title_oracle_ok=False)
+cls, why = H.verify(dict(REF))
+check("half a check is not a verdict: dead DOI + unreachable title oracle", cls == "UNCHECKABLE", f"got {cls}")
+check("...and it fails the gate", H.NO_ORACLE in why, f"got {why}")
+H._get = _real_get
+
+# 19. BAD-DOI is a defect worth fixing, not an accusation: it must not count as hard.
+src2 = (pathlib.Path(__file__).resolve().parent.parent / "hallucite.py").read_text()
+check("BAD-DOI is counted soft, never hard",
+      'elif cls in ("SUSPECT", "UNCHECKABLE", "BAD-DOI")' in src2
+      and '"BAD-DOI"' not in src2.split("if cls in (")[1].split(")")[0])
+
 print(f"\n{'ALL PASS' if not FAILS else str(len(FAILS)) + ' FAILED: ' + ', '.join(FAILS)}")
 sys.exit(0 if not FAILS else 1)

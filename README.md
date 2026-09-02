@@ -17,6 +17,7 @@ $ hallucite paper.bib
   [ ok ] vaswani2017        DOI resolves, title match 0.99
   [FABR] chen2007fiber      DOI 10.1109/JLT.2007.899999 does not resolve at doi.org
   [MISM] wuttke2003noise    DOI resolves to a DIFFERENT title (match 0.21)
+  [BDOI] vaswani2017        paper is real, DOI 10.5555/3295222.3295349 resolves nowhere
   [SUSP] smith2019book      no close Crossref match for title
   [??? ] internal2024       no DOI, arXiv id, or usable title
 
@@ -53,8 +54,9 @@ you find out about from a reviewer.
 
 | Class | Meaning | Gate |
 |---|---|---|
-| `FABRICATED` | DOI 404s, or an arXiv id with no record | hard fail |
+| `FABRICATED` | Identifier resolves nowhere **and** no record matches the title | hard fail |
 | `MISMATCH` | Resolves, but to a **different title** | hard fail |
+| `BAD-DOI` | The paper is real; the identifier resolves nowhere | warn |
 | `SUSPECT` | Title-only reference with no close Crossref match | warn |
 | `UNCHECKABLE` | No DOI, arXiv id, or usable title | warn |
 | `UNCHECKABLE` | A registry could not be reached | **hard fail** under `--gate` |
@@ -66,6 +68,15 @@ you find out about from a reviewer.
 `UNCHECKABLE`, never `FABRICATED`, and the tool refuses to fall back to fuzzy title matching
 to fill the gap. A verifier that cries fraud during a network outage is worse than no
 verifier, because you stop trusting it exactly when it is right.
+
+**A dead identifier is not a dead reference.** Publishers mistype, retire and never register
+DOIs for work that plainly exists, so a DOI that resolves nowhere is checked against its
+title before any verdict is passed. If the paper is real, you get `BAD-DOI`, which says fix
+the identifier, not `FABRICATED`, which says you made this up. ACM's `10.5555/*` range is the
+case that matters: `10.5555/3295222.3295349` is *Attention Is All You Need*, and it 404s.
+The bar for that rescue is 0.90 rather than the 0.60 used elsewhere, because a fabricated
+reference almost always carries a plausible title and a loose bar would launder exactly what
+this tool exists to catch.
 
 **The gate fails closed.** If no registry answered, `--gate` exits 1 and says so. Counting
 an unreachable oracle as a soft pass meant a fully offline run went green having verified
@@ -83,9 +94,6 @@ program, so there is nothing to hallucinate.
 
 ## Known limitations
 
-- **Some legitimately published work has a DOI that does not resolve at doi.org.** ACM's
-  `10.5555/*` proceedings range is the common example: `10.5555/3295222.3295349` returns 404
-  and will be reported `FABRICATED`. Check hard findings before acting on them.
 - Books, theses, standards, and non-indexed venues often have no DOI and land in `SUSPECT`
   or `UNCHECKABLE`. That is a prompt to look, not a verdict.
 - **Titles shorter than two characters, and `\bibitem` entries whose title is neither
