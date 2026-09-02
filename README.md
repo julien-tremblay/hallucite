@@ -88,6 +88,9 @@ program, so there is nothing to hallucinate.
   and will be reported `FABRICATED`. Check hard findings before acting on them.
 - Books, theses, standards, and non-indexed venues often have no DOI and land in `SUSPECT`
   or `UNCHECKABLE`. That is a prompt to look, not a verdict.
+- **Titles shorter than two characters, and `\bibitem` entries whose title is neither
+  quoted nor emphasised, parse without a title.** The DOI is still checked; the
+  title comparison simply does not run, and the reference reads `OK` on resolution alone.
 - **It catches invented and swapped references, not subtly altered ones.** Title comparison
   is lexical, so "Attention Is Not All You Need" scores 0.93 against "Attention Is All You
   Need" and passes, as does Recognition -> Segmentation. Authors, venue and year are parsed

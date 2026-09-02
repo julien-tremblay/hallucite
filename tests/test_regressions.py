@@ -162,5 +162,43 @@ check("an unreadable path exits 2, not 1",
       subprocess.run([sys.executable, HAL, "/nope/missing.bib", "--gate"],
                      capture_output=True).returncode == 2)
 
+
+# --- round 2 --------------------------------------------------------------------------
+
+# 13. norm() kept only [a-z0-9], which deletes every character of a title written in
+#     Japanese, Chinese, Cyrillic, Greek, Arabic, Hebrew or Korean. Two IDENTICAL non-Latin
+#     titles scored 0.00 and the reference was reported MISMATCH -- a hard failure, under
+#     --gate, on a correct citation.
+for t in ["\u91cf\u5b50\u8a08\u7b97\u306e\u57fa\u790e", "\u041a\u0432\u0430\u043d\u0442\u043e\u0432\u0430\u044f \u043a\u0440\u0438\u043f\u0442\u043e\u0433\u0440\u0430\u0444\u0438\u044f",
+          "\u0398\u03b5\u03c9\u03c1\u03af\u03b1 \u03c4\u03c9\u03bd \u03c0\u03b1\u03b9\u03b3\u03bd\u03af\u03c9\u03bd", "\ud55c\uad6d\uc5b4 \uc81c\ubaa9", "\u0646\u0638\u0631\u064a\u0629 \u0627\u0644\u0643\u0645"]:
+    check(f"a non-Latin title matches itself ({t[:6]})", H.title_match(t, t) >= 0.6,
+          f"got {H.title_match(t, t):.2f}")
+# Accents fold rather than vanish, so a LaTeX-escaped title still matches the registry's.
+check("LaTeX-escaped accents match the registry's unicode",
+      H.title_match(r'{\"U}ber die Quantenmechanik', "\u00dcber die Quantenmechanik") >= 0.6)
+# ...and the fold must not make everything match everything.
+check("an unrelated title still mismatches",
+      H.title_match("A totally unrelated title about penguins on the moon",
+                    "Continuous Variable Quantum Cryptography Using Coherent States") < 0.6)
+
+# 14. `[^{}]` could not cross the inner braces of `\emph{On {BIC} states}`, so a title with
+#     LaTeX case protection or inline math was dropped entirely and the reference lost its
+#     MISMATCH check -- the same nesting defect the bibtex field() parser already fixed.
+r = H.parse_bibitem(r"\bibitem{k} A., \emph{On {BIC} states in optics}, 2021.")
+check("emph title with nested braces is read", r and "BIC" in r[0]["title"],
+      f"got {r and r[0]['title']!r}")
+
+# 15. The quoted form is unambiguous, but a 6-character floor silently dropped ``Chaos'' and
+#     ``Two''. A reference with no parsed title gets no MISMATCH check at all.
+r = H.parse_bibitem("\\bibitem{a} A, ``One,'' 2001.\n\\bibitem{b} B, ``Chaos'', Nature, 2002.")
+check("short quoted titles are not dropped",
+      [x["title"] for x in r] == ["One", "Chaos"], f"got {[x['title'] for x in r]}")
+# The guards that made the floor look necessary must still hold.
+check("`et al.` is still not mistaken for a title",
+      H.parse_bibitem(r"\bibitem{k} S. Ma \emph{et al.}, ``The Era of 1-bit LLMs,'' 2024.")[0]["title"]
+      == "The Era of 1-bit LLMs")
+check("punctuation is still not mistaken for a title",
+      H.parse_bibitem(r"\bibitem{k} A., ``--,'' 2001.")[0]["title"] == "")
+
 print(f"\n{'ALL PASS' if not FAILS else str(len(FAILS)) + ' FAILED: ' + ', '.join(FAILS)}")
 sys.exit(0 if not FAILS else 1)

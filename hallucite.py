@@ -35,6 +35,7 @@ import os
 import re
 import sys
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -112,7 +113,20 @@ def _get(url, accept="application/json"):
 
 
 def norm(s):
-    return re.sub(r"[^a-z0-9 ]", " ", (s or "").lower()).split()
+    """Fold a title to comparable tokens.
+
+    This used to keep only [a-z0-9], which deletes every character of a title written in
+    Japanese, Chinese, Cyrillic, Greek, Arabic, Hebrew or Korean. Two IDENTICAL non-Latin
+    titles therefore scored 0.00 and the reference was reported MISMATCH -- a hard failure,
+    under --gate, on a correct citation. Measured 2026-09-02.
+
+    Accents are folded rather than deleted so that a LaTeX-escaped `{\"U}ber` still matches
+    the registry's `Über`; str.isalnum is Unicode-aware, so every other script survives
+    intact and compares against itself.
+    """
+    s = unicodedata.normalize("NFKD", (s or "").casefold())
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    return "".join(c if c.isalnum() else " " for c in s).split()
 
 
 def title_match(a, b):
@@ -249,14 +263,34 @@ def parse_bibitem(text):
         # that manufactures false positives fails a correct paper under --gate,
         # which is the same defect as one that passes a wrong one.
         title = ""
-        m = re.search(r"``(.{6,300}?)''", body, re.S)
+        # An explicit ``...'' or "..." IS the title, however short, so the floor here is 2.
+        # At 6 it silently dropped ``Chaos'' and ``Two'', and a reference with no parsed
+        # title gets no MISMATCH check at all.
+        m = re.search(r"``(.{2,300}?)''", body, re.S)
         if not m:
-            m = re.search(r'"(.{6,300}?)"', body, re.S)
-        if not m:
-            m = re.search(r"\\(?:emph|textit|textsl)\s*\{([^{}]{6,300})\}", body)
-        if m:
-            title = re.sub(r"\s+", " ", m.group(1)).strip().rstrip(".,")
-            if re.fullmatch(r"(?:et\s+al\.?|ibid\.?|op\.\s*cit\.?)", title, re.I):
+            m = re.search(r'"(.{2,300}?)"', body, re.S)
+        raw = m.group(1) if m else ""
+        if not raw:
+            # The emph fallback stays conservative (6 chars) because it is a guess, but it
+            # must count braces: `[^{}]` could not cross the inner braces of
+            # `\emph{On {BIC} states}`, so a title carrying LaTeX case protection or inline
+            # math was dropped entirely. Same defect the bibtex field() parser already fixed.
+            em = re.search(r"\\(?:emph|textit|textsl|textbf)\s*\{", body)
+            if em:
+                depth, j = 1, em.end()
+                while j < len(body) and depth:
+                    if body[j] == "{":
+                        depth += 1
+                    elif body[j] == "}":
+                        depth -= 1
+                    j += 1
+                if not depth and 6 <= j - 1 - em.end() <= 300:
+                    raw = body[em.end() : j - 1]
+        if raw:
+            title = re.sub(r"\s+", " ", raw).strip().rstrip(".,")
+            # Bibliographies use these where a title would sit; none of them is one.
+            if re.fullmatch(r"(?:et\s+al\.?|ibid\.?|op\.\s*cit\.?|eds?\.?|"
+                            r"[\W\d_]+)", title, re.I):
                 title = ""
         doi = ""
         md = re.search(DOI_RE, body)
