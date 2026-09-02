@@ -1,0 +1,33 @@
+name: tests
+on: [push, pull_request]
+
+jobs:
+  offline:
+    # Only the OFFLINE suite runs here. `hallucite.py --selftest` and `bench/` both hit
+    # Crossref and arXiv, and a rate-limited CI run would fail for reasons that have
+    # nothing to do with the change under review. A gate that fails for the wrong reason
+    # gets switched off, which is the same defect this tool exists to prevent.
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python3 tests/test_regressions.py
+      - name: hallucite.py is a single stdlib-only file
+        if: matrix.python == '3.12'   # sys.stdlib_module_names is 3.10+
+        run: |
+          python3 - <<'PY'
+          import ast, sys
+          tree = ast.parse(open("hallucite.py").read())
+          mods = {(n.module or "").split(".")[0] for n in ast.walk(tree)
+                  if isinstance(n, ast.ImportFrom)}
+          mods |= {a.name.split(".")[0] for n in ast.walk(tree)
+                   if isinstance(n, ast.Import) for a in n.names}
+          third = mods - set(sys.stdlib_module_names)
+          assert not third, f"non-stdlib import: {third}"
+          print("stdlib only:", sorted(mods))
+          PY

@@ -26,7 +26,9 @@ summary: 2 hard (fabricated/mismatch), 2 soft (suspect/uncheckable)
 
 ## Install
 
-There is nothing to install. One file, Python 3.9+, standard library only.
+There is nothing to install. One file, Python 3.9+, standard library only. Both claims are
+checked on every push: CI runs the offline suite on 3.9 and 3.12 and asserts that the module
+imports nothing outside the standard library.
 
 ```
 curl -O https://raw.githubusercontent.com/julien-tremblay/hallucite/main/hallucite.py
