@@ -14,14 +14,14 @@ which ones do not exist.
 $ hallucite paper.bib
 
 == paper.bib (42 refs) ==
-  [ ok ] vaswani2017        DOI resolves, title match 0.99
+  [ ok ] devlin2019bert     DOI resolves, title match 0.99
   [FABR] chen2007fiber      DOI 10.1109/JLT.2007.899999 does not resolve at doi.org
   [MISM] wuttke2003noise    DOI resolves to a DIFFERENT title (match 0.21)
   [BDOI] vaswani2017        paper is real, DOI 10.5555/3295222.3295349 resolves nowhere
   [SUSP] smith2019book      no close Crossref match for title
   [??? ] internal2024       no DOI, arXiv id, or usable title
 
-summary: 2 hard (fabricated/mismatch), 2 soft (suspect/uncheckable)
+summary: 2 hard (fabricated/mismatch), 3 soft (suspect/uncheckable)
 ```
 
 ## Install
@@ -63,6 +63,41 @@ you find out about from a reviewer.
 | `UNCHECKABLE` | No DOI, arXiv id, or usable title | warn |
 | `UNCHECKABLE` | A registry could not be reached | **hard fail** under `--gate` |
 | `OK` | Resolved and the title matches | pass |
+
+## How often does it accuse you wrongly
+
+Once, measurably: never, on 740 real references.
+
+That is the number that matters for a tool making this promise, and it did not exist until
+2026-09-02. `bench/` draws a random sample of real works from Crossref, so every reference in
+it is real by construction and any hard finding is a false accusation with a diagnosis
+attached. Re-run it yourself; it takes about ten minutes and needs no key.
+
+| Set | n | False positives |
+|---|---|---|
+| registry titles verbatim | 370 | **0** |
+| the same works, deformed the way real bibliographies are | 370 | **0** |
+
+The sample covers four decades and four Crossref types, and includes 22 DOIs carrying the
+pre-2008 `<>#+` suffix charset and 90 non-Latin titles. The deformed set is the one that
+counts: a raw round-trip compares exact strings to themselves and proves very little, so the
+second set adds LaTeX-escaped accents, dropped subtitles, case changes, a trailing period on
+the DOI, and an indented closing brace.
+
+A control arm runs alongside so the measurement can fail. Without it, a verifier that
+returned `OK` unconditionally would score perfectly. It fires: 38 of 40 invented references
+caught with **none passed as `OK`**, and 36 of 40 real papers with deliberately broken DOIs
+correctly rescued as `BAD-DOI` rather than accused.
+
+**What this does not cover, and it is the important part.** Every sampled work is
+Crossref-registered, so its DOI always resolves. The measurement structurally cannot reach
+the class where `FABRICATED` false positives actually live: work registered with another
+agency, or not registered at all. The control arm is the closest proxy and puts the residual
+at 4 in 40 when a real paper's identifier is dead, failing on generic titles ("Nephrology
+news") and on records Crossref's own search does not rank in its top ten. **False negatives
+are not measured at all.**
+
+Full method and caveats: [`bench/README.md`](bench/README.md).
 
 ## Design commitments
 
@@ -115,12 +150,45 @@ program, so there is nothing to hallucinate.
 - It checks that a reference *exists and matches*. It cannot check that the reference
   *supports the claim it is attached to*.
 
+## What I would like you to break
+
+This is the useful part of opening it. Feedback that changes the tool is worth far more than
+a star, and these are the places I already believe it is weakest. If you confirm any of them
+with a concrete case, that is a bug report I can act on.
+
+1. **Run it on a bibliography full of non-Crossref DOIs** (DataCite, an institutional
+   repository, Zenodo, a national aggregator). The false-positive measurement cannot reach
+   that class at all, so this is the largest genuinely unknown area.
+2. **Run it on a bibliography that is not in English.** 90 non-Latin titles were tested one
+   at a time against their own registry records. No real Japanese, Chinese, Russian or Greek
+   bibliography has been run through it end to end.
+3. **Tell me the thresholds are wrong.** A title scores 0..1; 0.60 separates `OK` from
+   `MISMATCH` and 0.90 is the bar for saying two titles are the same work. Both were chosen
+   to satisfy cases I had, not derived from anything.
+4. **Break the parsers.** `.bbl`, RIS, Zotero and Mendeley exports, biblatex `@online`,
+   `crossref`-inherited fields, and `@string` macros are all untested. A file that plainly
+   contains references and yields zero is reported as a parser failure, but a file that
+   yields *some* is not, and silent partial loss is the defect this tool exists to prevent.
+5. **Argue with `BAD-DOI`.** Splitting "this identifier is dead" from "this paper does not
+   exist" may be over-generous. A fabricated reference carrying a plausible real title gets
+   downgraded from `FABRICATED` to a warning, and I am not certain 0.90 is high enough.
+6. **Tell me it should compare authors and years.** It parses both and compares neither.
+   Several other tools do, and that is the whole "real paper, mangled metadata" class this
+   one misses by design.
+
+Open an issue with the input that broke it, or a failing case in `tests/`. Disagreement
+about the design is as welcome as a bug; see [`CONTRIBUTING.md`](CONTRIBUTING.md).
+
 ## Tests
 
 ```
-python3 hallucite.py --selftest     # live, hits Crossref and arXiv
-python3 tests/test_regressions.py   # offline, locks in fixed defects
+python3 tests/test_regressions.py   # offline, no network, ~1s. This is what CI runs.
+python3 hallucite.py --selftest     # live, hits Crossref and arXiv, ~10s
 ```
+
+Every case in the offline suite is a defect that actually shipped. It runs on every push, on
+Python 3.9 and 3.12. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the false-positive
+measurement and what a useful patch looks like.
 
 ## License
 
