@@ -8,11 +8,22 @@ So this is a $0, no-LLM, network-only check that resolves every reference agains
 registries (Crossref for DOIs/titles, arXiv for eprints) and classifies it.
 
 Classes (most→least dangerous):
-  FABRICATED  a DOI that 404s, or an arXiv id with no record        -> hard fail (exit 1)
-  MISMATCH    DOI/arXiv resolves, but to a DIFFERENT title          -> hard fail (exit 1)
-  SUSPECT     title-only ref with no close Crossref match           -> warn (may be a book/thesis/non-indexed venue)
+  FABRICATED  a DOI that 404s, or an arXiv id with no record        -> hard
+  MISMATCH    DOI/arXiv resolves, but to a DIFFERENT title          -> hard
+  SUSPECT     title-only ref with no close Crossref match           -> soft (may be a book/thesis/non-indexed venue)
   OK          resolved and title matches                            -> pass
-  UNCHECKABLE no DOI / arXiv / usable title                         -> warn (can't verify, not necessarily wrong)
+  UNCHECKABLE no DOI / arXiv / usable title, or registry unreachable-> soft; unreachable also fails --gate
+
+Exit codes. Without --gate the tool is advisory and always exits 0 (2 on a usage error);
+read the summary line. With --gate it exits 1 on any hard finding, and also when a registry
+could not be reached, because a check that did not run must not report a pass. --strict
+additionally fails on SUSPECT and on references carrying no identifier.
+
+What it does NOT catch: a citation whose title is close but wrong. Title comparison is
+lexical, so "Attention Is Not All You Need" scores 0.93 against "Attention Is All You Need"
+and passes, as does Recognition -> Segmentation. It catches invented and swapped
+references, not subtly altered ones. Authors, venue and year are parsed but never
+compared.
 
 Usage:  hallucite <file.bib | file.tex | file.md> [...]   (--strict makes SUSPECT fail too)
 Grounding lives in the REGISTRY, never the language. Advisory by default; wire into a commit hook with --gate.
@@ -35,15 +46,43 @@ MAILTO = os.environ.get("CROSSREF_MAILTO", "").strip()
 UA = "hallucite/1.0 (+https://github.com/julien-tremblay/hallucite)" + (
     f" mailto:{MAILTO}" if MAILTO else "")
 TIMEOUT = 12
+# Prefix on every "the oracle could not answer" message. verify() used to detect these by
+# looking for the substrings "error"/"HTTP" in a human-readable sentence, which failed twice
+# over: a non-JSON response said neither, so a fabricated DOI fell through to fuzzy title
+# matching and came back OK; and the French "erreur" does not contain "error". A sentinel is
+# checked, not guessed at.
+NO_ORACLE = "oracle unavailable: "
 # arXiv id: new-style 2101.01234[v2] OR old-style quant-ph/0101012, math.AG/0512013
 ARXIV_RE = r"(\d{4}\.\d{4,5}|[a-z-]+(?:\.[A-Z]{2})?/\d{7})"
+# Crossref restricted the DOI suffix charset in 2008 but never invalidated what was already
+# minted, so `<`, `>`, `#` and `+` are legal in pre-2008 DOIs. Wiley's SICI form is the
+# common case and it is not rare: 99 of 100 Angewandte Chemie records from 2000-2002 carry
+# one. Excluding these characters truncated the DOI at the `<`, and two verifiably real
+# papers came back FABRICATED -- a false accusation, the worst output this tool has.
+# Measured 2026-09-02 against live Crossref.
+DOI_RE = r"\b10\.\d{4,9}/[-._;()/:A-Za-z0-9<>#+]+"
+_CLOSERS = {")": "(", "]": "[", "}": "{", ">": "<"}
 
 
 def clean_doi(doi):
     """Trailing punctuation is a prose habit, not part of the DOI. Leaving it attached
     makes doi.org 404 and the reference read as FABRICATED, which is a false accusation
     and the most damaging thing this tool can do."""
-    return (doi or "").strip().strip("<>").rstrip(".,;:)]}'\"").strip()
+    d = (doi or "").strip()
+    if d.startswith("<") and d.endswith(">"):
+        d = d[1:-1]  # a markdown autolink, <https://doi.org/...>
+    while d:
+        if d[-1] in ".,;:'\"":
+            d = d[:-1]
+            continue
+        # A legacy DOI's brackets are BALANCED (`...40:6<2004::AID-ANIE2004>3.0.CO;2-5`),
+        # so an unbalanced closer came from the surrounding prose, not the identifier.
+        # Stripping closers unconditionally, as this did, truncated real DOIs.
+        if d[-1] in _CLOSERS and d.count(_CLOSERS[d[-1]]) != d.count(d[-1]):
+            d = d[:-1]
+            continue
+        break
+    return d.strip()
 
 
 def _get(url, accept="application/json"):
@@ -51,8 +90,25 @@ def _get(url, accept="application/json"):
     application/vnd.citationstyles.csl+json to return metadata rather than a redirect
     to the publisher landing page."""
     req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": accept})
-    with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
-        return r.read().decode("utf-8", "replace"), r.status
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+                return r.read().decode("utf-8", "replace"), r.status
+        except urllib.error.HTTPError as e:
+            # 429 and 503 mean "come back later", not "no such record". Without a retry, a
+            # bibliography large enough to trip the rate limiter comes back entirely
+            # unverified and --gate fails the build for a reason that has nothing to do
+            # with the references. That is how a gate gets switched off for good. Measured
+            # 2026-09-02: 22 title queries in one file, all 429, all UNVERIFIED.
+            if e.code not in (429, 503) or attempt == 2:
+                raise
+            wait = e.headers.get("Retry-After") if e.headers else None
+            try:
+                delay = float(wait)
+            except (TypeError, ValueError):
+                delay = 2.0 * (attempt + 1)
+            time.sleep(min(max(delay, 1.0), 10.0))
+    raise urllib.error.URLError("retries exhausted")  # pragma: no cover
 
 
 def norm(s):
@@ -69,18 +125,45 @@ def title_match(a, b):
 
 
 # ---- reference extraction --------------------------------------------------
+def _entries(text):
+    """Yield (etype, key, body) for each @entry, counting braces.
+
+    The old regex required the closing brace to start a line. An indented `  }`, a `}}`
+    riding on the last field's line, and a one-line entry were all INVISIBLE, and an
+    invisible entry is not reported as anything -- it is simply absent from the count.
+    Measured 2026-09-02: a two-entry file whose second entry carried a fabricated DOI and
+    an indented closing brace passed --gate with exit 0. Silent partial loss is the exact
+    failure this tool exists to prevent, so the scanner must not depend on layout.
+    """
+    for m in re.finditer(r"@(\w+)\s*\{", text):
+        i = m.end()
+        depth, j = 1, i
+        while j < len(text) and depth:
+            if text[j] == "{":
+                depth += 1
+            elif text[j] == "}":
+                depth -= 1
+            j += 1
+        if depth:
+            continue  # unterminated entry: truncated file
+        key, _, body = text[i : j - 1].partition(",")
+        yield m.group(1).lower(), key.strip(), body
+
+
 def parse_bib(text):
     """Yield dicts for each @entry with the fields we can verify."""
     refs = []
-    for m in re.finditer(r"@(\w+)\s*\{\s*([^,]+),(.*?)\n\}", text, re.S):
+    for etype, key, body in _entries(text):
         # The old bibtex entry regex stopped before the final newline while field()
         # required a trailing one, so the LAST field of every entry was invisible.
         # Worst case: when title came last it parsed as empty, check_doi took the
         # 'no claimed title' branch, and returned OK for any DOI that resolved. That
         # silently disabled MISMATCH detection, which is the entire point of the tool.
-        etype, key, body = m.group(1).lower(), m.group(2).strip(), m.group(3) + "\n"
-        if etype in ("comment", "string", "preamble"):
+        # `control` is REVTeX's bookkeeping entry (@CONTROL{REVTEX42Control}); it carries
+        # no reference. It only became visible once the scanner stopped needing a newline.
+        if etype in ("comment", "string", "preamble", "control") or not body.strip():
             continue
+        body += "\n"
 
         def field(name):
             """One field's value, counting braces.
@@ -91,7 +174,12 @@ def parse_bib(text):
             benign because norm() splits on non-alphanumerics, but the value
             shown to the user was wrong and a stricter consumer would break.
             """
-            fm = re.search(name + r"\s*=\s*", body, re.I)
+            # The name must sit at a field boundary. Without the delimiter, `title`
+            # matched inside `booktitle` and `journaltitle` -- whichever came first won,
+            # so an @inproceedings that listed booktitle before title had the PROCEEDINGS
+            # NAME checked against the DOI and a correct reference was reported MISMATCH.
+            # biblatex, which spells the field `journaltitle`, is hit on every article.
+            fm = re.search(r"(?:^|[,{\s])" + name + r"\s*=\s*", body, re.I)
             if not fm:
                 return ""
             i = fm.end()
@@ -109,6 +197,14 @@ def parse_bib(text):
             return body[i:].split(",")[0].strip()
 
         doi = clean_doi(field("doi"))
+        if not doi:
+            # @misc entries routinely park the DOI in `note` or `howpublished` rather than
+            # a `doi` field. The arXiv branch below already falls back to scanning the
+            # whole entry; the DOI branch did not, so a reference carrying a resolvable
+            # DOI in plain sight came back UNCHECKABLE.
+            dm = re.search(DOI_RE, body)
+            if dm:
+                doi = clean_doi(dm.group(0))
         eprint = field("eprint")
         # arXiv id: new-style (2101.01234) OR old-style (quant-ph/0101012, math.AG/0512013)
         arxiv = ""
@@ -163,7 +259,7 @@ def parse_bibitem(text):
             if re.fullmatch(r"(?:et\s+al\.?|ibid\.?|op\.\s*cit\.?)", title, re.I):
                 title = ""
         doi = ""
-        md = re.search(r"\b10\.\d{4,9}/[-._;()/:A-Za-z0-9]+", body)
+        md = re.search(DOI_RE, body)
         if md:
             doi = clean_doi(md.group(0).lower())
         arx = ""
@@ -190,12 +286,12 @@ def parse_bibitem(text):
 def parse_inline(text):
     """Fallback: pull bare DOIs and arXiv ids out of prose/tex (no title to match)."""
     refs = []
-    for d in sorted(set(re.findall(r"\b10\.\d{4,9}/[-._;()/:A-Za-z0-9]+", text))):
+    for d in sorted({clean_doi(x) for x in re.findall(DOI_RE, text)}):
         refs.append(
             {
                 "key": d,
                 "type": "inline-doi",
-                "doi": d.lower().rstrip(".,;)"),
+                "doi": d.lower(),
                 "arxiv": "",
                 "title": "",
                 "year": "",
@@ -223,7 +319,7 @@ def check_doi(doi, claimed_title):
         )
     except urllib.error.HTTPError as e:
         if e.code != 404:
-            return "UNCHECKABLE", f"Crossref HTTP {e.code}"
+            return "UNCHECKABLE", NO_ORACLE + f"Crossref HTTP {e.code}"
         # ABSENCE FROM ONE REGISTRY IS NOT ABSENCE. Crossref only knows DOIs registered with Crossref. DataCite DOIs 404 there
         # while being perfectly valid: that covers most institutional repositories and
         # every arXiv DOI (10.48550/*). Verified live 2026-08-13: 10.48550/arXiv.2512.24601,
@@ -240,33 +336,38 @@ def check_doi(doi, claimed_title):
                     "FABRICATED",
                     f"DOI {doi} does not resolve at doi.org (all registration agencies)",
                 )
-            return "UNCHECKABLE", f"doi.org HTTP {e2.code}"
+            return "UNCHECKABLE", NO_ORACLE + f"doi.org HTTP {e2.code}"
         except Exception as e2:  # noqa: BLE001
-            return "UNCHECKABLE", f"doi.org erreur: {type(e2).__name__}"
+            return "UNCHECKABLE", NO_ORACLE + f"doi.org {type(e2).__name__}"
         try:
             _csl = json.loads(_b)
         except ValueError:
-            return "OK", f"DOI {doi} resout hors Crossref (titre non lisible)"
+            # It resolves, so it is not fabricated -- but with no readable metadata the
+            # title cannot be compared, and a MISMATCH is exactly what would hide here.
+            # Reporting OK claimed a check that never ran.
+            return "UNCHECKABLE", NO_ORACLE + f"{doi} resolves but returned no metadata"
         found = _csl.get("title") or ""
         if isinstance(found, list):
             found = found[0] if found else ""
         if not claimed_title:
-            return "OK", f"DOI resout via une agence non-Crossref: {found[:60]}"
+            return "OK", f"DOI resolves via a non-Crossref agency: {found[:60]}"
         r = title_match(claimed_title, found)
         return (
-            ("OK", f"DOI resout hors Crossref, titre concorde {r:.2f}")
+            ("OK", f"DOI resolves (non-Crossref agency), title match {r:.2f}")
             if r >= 0.6
             else (
                 "MISMATCH",
-                f"DOI resout a un titre DIFFERENT (match {r:.2f}): '{found[:60]}'",
+                f"DOI resolves to a DIFFERENT title (match {r:.2f}): '{found[:60]}'",
             )
         )
     except Exception as e:  # noqa: BLE001
-        return "UNCHECKABLE", f"Crossref error: {type(e).__name__}"
+        return "UNCHECKABLE", NO_ORACLE + f"Crossref {type(e).__name__}"
     try:
         _j = json.loads(body)
     except ValueError:
-        return "UNCHECKABLE", "reponse non-JSON (page d'erreur ou corps tronque)"
+        # A 200 carrying an HTML maintenance or captcha page. This is an outage wearing a
+        # success code, and it must poison the result rather than fall through.
+        return "UNCHECKABLE", NO_ORACLE + "Crossref returned non-JSON (error page?)"
     msg = _j.get("message", {})
     found = (msg.get("title") or [""])[0]
     if not claimed_title:
@@ -285,8 +386,10 @@ def check_doi(doi, claimed_title):
 def check_arxiv(aid, claimed_title):
     try:
         body, _ = _get(f"http://export.arxiv.org/api/query?id_list={aid}&max_results=1")
+    except urllib.error.HTTPError as e:
+        return "UNCHECKABLE", NO_ORACLE + f"arXiv HTTP {e.code}"
     except Exception as e:  # noqa: BLE001
-        return "UNCHECKABLE", f"arXiv error: {type(e).__name__}"
+        return "UNCHECKABLE", NO_ORACLE + f"arXiv {type(e).__name__}"
     entries = re.findall(r"<entry>(.*?)</entry>", body, re.S)
     if not entries:
         return "FABRICATED", f"arXiv:{aid} has no record"
@@ -311,12 +414,14 @@ def check_title(title):
         body, _ = _get(
             f"https://api.crossref.org/works?query.bibliographic={q}&rows=3&mailto={MAILTO}"
         )
+    except urllib.error.HTTPError as e:
+        return "UNCHECKABLE", NO_ORACLE + f"Crossref HTTP {e.code}"
     except Exception as e:  # noqa: BLE001
-        return "UNCHECKABLE", f"Crossref error: {type(e).__name__}"
+        return "UNCHECKABLE", NO_ORACLE + f"Crossref {type(e).__name__}"
     try:
         _j = json.loads(body)
     except ValueError:
-        return "UNCHECKABLE", "reponse non-JSON (page d'erreur ou corps tronque)"
+        return "UNCHECKABLE", NO_ORACLE + "Crossref returned non-JSON (error page?)"
     items = _j.get("message", {}).get("items", [])
     best = max(
         (title_match(title, (it.get("title") or [""])[0]) for it in items), default=0.0
@@ -353,14 +458,14 @@ def verify(ref):
         cls, why = check_doi(ref["doi"], ref["title"])
         if cls != "UNCHECKABLE":
             return cls, why
-        if "error" in why.lower() or "HTTP" in why:
-            degraded = f"DOI lookup unavailable ({why})"
+        if why.startswith(NO_ORACLE):
+            degraded = "DOI " + why
     if ref["arxiv"]:
         cls, why = check_arxiv(ref["arxiv"], ref["title"])
         if cls != "UNCHECKABLE":
             return cls, why
-        if "error" in why.lower() or "HTTP" in why:
-            degraded = f"arXiv lookup unavailable ({why})"
+        if why.startswith(NO_ORACLE):
+            degraded = "arXiv " + why
     if degraded:
         # Do NOT fall through to title matching. A weaker method cannot clear an identifier
         # that was never actually checked.
@@ -488,7 +593,18 @@ def selftest():
     sys.exit(0 if ok else 1)
 
 
+KNOWN_FLAGS = {"--strict", "--gate", "--selftest"}
+
+
 def main():
+    # A misspelled flag used to be dropped silently, so `--gates` ran advisory and exited 0
+    # while the caller believed they were gating. A gate you think you enabled and did not
+    # is worse than no gate.
+    bad = [a for a in sys.argv[1:] if a.startswith("-") and a not in KNOWN_FLAGS]
+    if bad:
+        print(f"unknown option(s): {' '.join(bad)}", file=sys.stderr)
+        print(f"known options: {' '.join(sorted(KNOWN_FLAGS))}", file=sys.stderr)
+        sys.exit(2)
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     strict = "--strict" in sys.argv
     gate = "--gate" in sys.argv
@@ -502,13 +618,19 @@ def main():
             "\nusage: hallucite <file.bib|.tex|.md> [...] [--strict] [--gate] [--selftest]"
         )
         sys.exit(2)
-    hard, soft = 0, 0
+    hard, soft, degraded = 0, 0, 0
     # Parse every input BEFORE judging any of it: a .tex citing into a sibling .bib is the
     # standard LaTeX layout, and judging the .tex alone reported a hard parser failure for
     # a perfectly normal paper.
     parsed = []
     for path in args:
-        text = open(path, encoding="utf-8", errors="replace").read()
+        # An unreadable path used to raise, and the traceback exited 1 -- indistinguishable
+        # under --gate from "this bibliography contains fabricated references".
+        try:
+            text = open(path, encoding="utf-8", errors="replace").read()
+        except OSError as e:
+            print(f"cannot read {path}: {e.strerror}", file=sys.stderr)
+            sys.exit(2)
         if path.endswith(".bib") or "@article" in text or "@inproceedings" in text:
             refs = parse_bib(text)
         elif r"\bibitem" in text:
@@ -545,6 +667,8 @@ def main():
                 hard += 1
             elif cls in ("SUSPECT", "UNCHECKABLE"):
                 soft += 1
+                if NO_ORACLE in why:
+                    degraded += 1
             icon = {
                 "OK": " ok ",
                 "FABRICATED": "FABR",
@@ -556,9 +680,20 @@ def main():
             time.sleep(0.25)  # be polite to Crossref/arXiv
     print(
         f"\nsummary: {hard} hard (fabricated/mismatch), {soft} soft (suspect/uncheckable)"
+        + (f", {degraded} UNVERIFIED (registry unreachable)" if degraded else "")
     )
+    if degraded:
+        print(
+            f"WARNING: {degraded} reference(s) could not be checked against any registry.\n"
+            "         This run does not clear them. Re-run when the registry answers."
+        )
     if gate:
-        sys.exit(1 if hard or (strict and soft) else 0)
+        # A gate must fail closed. Rate-limited or offline, every reference comes back
+        # UNCHECKABLE, and counting that as a soft pass meant --gate exited 0 having
+        # verified nothing at all -- green because the oracle was down. Measured
+        # 2026-09-02 with the network blackholed: two fabricated DOIs, exit 0.
+        # A reference with no identifier to check is a different thing, and still soft.
+        sys.exit(1 if hard or degraded or (strict and soft) else 0)
     sys.exit(0)
 
 

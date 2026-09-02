@@ -38,9 +38,13 @@ faster and more reliable. It works without it.
 ## Use it as a gate
 
 ```
-hallucite --gate paper.bib      # exit 1 if anything is FABRICATED or MISMATCH
-hallucite --strict --gate *.bib # also fail on SUSPECT
+hallucite --gate paper.bib      # exit 1 if anything is FABRICATED or MISMATCH,
+                                # or if a registry could not be reached
+hallucite --strict --gate *.bib # also fail on SUSPECT and on unidentifiable refs
 ```
+
+Without `--gate` the tool is advisory and always exits 0; read the summary line. Exit 2
+means a usage error (unknown flag, unreadable file), never a verdict.
 
 Drop it in a pre-commit hook or CI step and a fabricated reference stops being something
 you find out about from a reviewer.
@@ -53,6 +57,7 @@ you find out about from a reviewer.
 | `MISMATCH` | Resolves, but to a **different title** | hard fail |
 | `SUSPECT` | Title-only reference with no close Crossref match | warn |
 | `UNCHECKABLE` | No DOI, arXiv id, or usable title | warn |
+| `UNCHECKABLE` | A registry could not be reached | **hard fail** under `--gate` |
 | `OK` | Resolved and the title matches | pass |
 
 ## Design commitments
@@ -61,6 +66,11 @@ you find out about from a reviewer.
 `UNCHECKABLE`, never `FABRICATED`, and the tool refuses to fall back to fuzzy title matching
 to fill the gap. A verifier that cries fraud during a network outage is worse than no
 verifier, because you stop trusting it exactly when it is right.
+
+**The gate fails closed.** If no registry answered, `--gate` exits 1 and says so. Counting
+an unreachable oracle as a soft pass meant a fully offline run went green having verified
+nothing at all, which is the same reassuring green as a clean bibliography. A reference that
+simply carries no identifier is a different thing, and stays soft.
 
 **A parser failure is not a clean bill of health.** If a file plainly contains citations and
 zero are parsed, that is reported as a hard failure rather than "0 fabricated." Silent
@@ -78,6 +88,11 @@ program, so there is nothing to hallucinate.
   and will be reported `FABRICATED`. Check hard findings before acting on them.
 - Books, theses, standards, and non-indexed venues often have no DOI and land in `SUSPECT`
   or `UNCHECKABLE`. That is a prompt to look, not a verdict.
+- **It catches invented and swapped references, not subtly altered ones.** Title comparison
+  is lexical, so "Attention Is Not All You Need" scores 0.93 against "Attention Is All You
+  Need" and passes, as does Recognition -> Segmentation. Authors, venue and year are parsed
+  but never compared. If your concern is a real paper cited with mangled metadata rather
+  than a paper that does not exist, this is not the tool.
 - Title matching is fuzzy (difflib ratio). A heavily abbreviated title can read as a
   `MISMATCH`.
 - It checks that a reference *exists and matches*. It cannot check that the reference
