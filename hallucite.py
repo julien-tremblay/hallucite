@@ -78,25 +78,18 @@ def parse_bib(text):
         # Worst case: when title came last it parsed as empty, check_doi took the
         # 'no claimed title' branch, and returned OK for any DOI that resolved. That
         # silently disabled MISMATCH detection, which is the entire point of the tool.
-        # un `\n` terminal: le DERNIER champ de chaque entree etait donc
-        # invisible. Consequence la plus grave: si `title` est en dernier, il est
-        # vide, check_doi prend la branche `not claimed_title` et retourne OK sur
-        # tout DOI qui resout. La detection de MISMATCH, raison d'etre de l'outil,
-        # etait desactivee EN SILENCE sur une entree parfaitement bien formee.
         etype, key, body = m.group(1).lower(), m.group(2).strip(), m.group(3) + "\n"
         if etype in ("comment", "string", "preamble"):
             continue
 
         def field(name):
-            """Valeur d'un champ, en comptant les accolades.
+            """One field's value, counting braces.
 
-            L'ancienne version utilisait `[{"](.+?)[}"]`, aveugle a
-            l'imbrication. Sur la protection de casse BibTeX, universelle en
-            physique (`title = {{Bell} inequalities ...}`), elle laissait une
-            accolade orpheline dans la valeur. Ici l'effet etait benin parce que
-            norm() decoupe sur les non-alphanumeriques, mais la valeur affichee
-            a l'utilisateur etait fausse et un futur consommateur plus strict
-            aurait casse.
+            The earlier `[{"](.+?)[}"]` was blind to nesting. BibTeX case
+            protection is universal in physics (`title = {{Bell} inequalities
+            ...}`), so it left an orphan brace in the value. The effect here was
+            benign because norm() splits on non-alphanumerics, but the value
+            shown to the user was wrong and a stricter consumer would break.
             """
             fm = re.search(name + r"\s*=\s*", body, re.I)
             if not fm:
@@ -231,8 +224,7 @@ def check_doi(doi, claimed_title):
     except urllib.error.HTTPError as e:
         if e.code != 404:
             return "UNCHECKABLE", f"Crossref HTTP {e.code}"
-        # ABSENCE D'UN REGISTRE N'EST PAS ABSENCE. Crossref ne connait que les DOI
-        # Crossref only knows DOIs registered with Crossref. DataCite DOIs 404 there
+        # ABSENCE FROM ONE REGISTRY IS NOT ABSENCE. Crossref only knows DOIs registered with Crossref. DataCite DOIs 404 there
         # while being perfectly valid: that covers most institutional repositories and
         # every arXiv DOI (10.48550/*). Verified live 2026-08-13: 10.48550/arXiv.2512.24601,
         # a real arXiv DOI, was reported FABRICATED for a week, and rightly
