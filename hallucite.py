@@ -144,6 +144,13 @@ def _ordered_coverage(ta, tb):
 # merely BEGINS with the cited one scores 1.00 -- which is how "Attention Is All You Need"
 # was certified against "Attention Is All You Need: An Analysis Of The Valuation Of Art".
 _CONTAINMENT_CEILING = 0.85
+# The bar that says "this IS that work". Containment sits strictly below it, so ordered
+# containment alone can never certify identity anywhere in the tool. It was 0.75 for a
+# title-only reference, which put the bar INSIDE the containment band: on real data seven
+# references flipped SUSPECT -> OK at exactly 0.85, among them an 1812 Hegel volume matched
+# against some modern paper named after it. A reference carrying no identifier at all is
+# precisely where a containment-only match should NOT be enough.
+IDENTITY = 0.90
 
 
 def title_match(a, b):
@@ -501,7 +508,7 @@ def check_title(title):
         return "UNCHECKABLE", found
     return (
         ("OK", f"title found in Crossref (match {best:.2f})")
-        if best >= 0.75
+        if best >= IDENTITY
         else (
             "SUSPECT",
             f"no close Crossref match (best {best:.2f}) - verify by hand (book/thesis/non-indexed?)",
@@ -532,7 +539,7 @@ def _unresolvable(doi, claimed_title):
         # Half a check is not a verdict: the DOI is definitively dead, but with no way to
         # ask about the title we cannot tell a wrong identifier from an invented paper.
         return "UNCHECKABLE", f"{found} -- {doi} resolves nowhere, title unverified"
-    if best >= 0.90:
+    if best >= IDENTITY:
         return "BAD-DOI", (f"the paper is real (Crossref match {best:.2f}: "
                            f"'{found[:50]}') but DOI {doi} resolves nowhere: wrong, "
                            f"retired or never-registered identifier")

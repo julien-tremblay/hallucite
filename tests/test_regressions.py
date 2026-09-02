@@ -268,5 +268,23 @@ check("BAD-DOI is counted soft, never hard",
       'elif cls in ("SUSPECT", "UNCHECKABLE", "BAD-DOI")' in src2
       and '"BAD-DOI"' not in src2.split("if cls in (")[1].split(")")[0])
 
+
+# 20. The identity bar must sit ABOVE the containment ceiling everywhere, or ordered
+#     containment alone certifies a match. check_title's bar was 0.75, which put it INSIDE
+#     the band: on real data seven title-only references flipped SUSPECT -> OK at exactly
+#     0.85, among them an 1812 Hegel volume matched against a modern paper named after it.
+#     A reference carrying no identifier at all is the last place a containment-only match
+#     should be enough.
+check("the identity bar sits above the containment ceiling",
+      H.IDENTITY > H._CONTAINMENT_CEILING,
+      f"IDENTITY={H.IDENTITY} ceiling={H._CONTAINMENT_CEILING}")
+H._get = _mock(best_title="Science of Logic and Its Reception in Twentieth Century Analytic Philosophy")
+cls, why = H.verify({"doi": "", "arxiv": "", "year": "", "title": "Science of Logic", "key": "hegel"})
+check("a title-only ref is not cleared by containment alone", cls == "SUSPECT", f"got {cls}: {why}")
+H._get = _mock(best_title="Science of Logic")
+cls, _ = H.verify({"doi": "", "arxiv": "", "year": "", "title": "Science of Logic", "key": "hegel"})
+check("...but an exact title-only match still clears", cls == "OK", f"got {cls}")
+H._get = _real_get
+
 print(f"\n{'ALL PASS' if not FAILS else str(len(FAILS)) + ' FAILED: ' + ', '.join(FAILS)}")
 sys.exit(0 if not FAILS else 1)
