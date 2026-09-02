@@ -83,6 +83,10 @@ an unreachable oracle as a soft pass meant a fully offline run went green having
 nothing at all, which is the same reassuring green as a clean bibliography. A reference that
 simply carries no identifier is a different thing, and stays soft.
 
+**A registry's own gaps are not accusations.** A Crossref record with an empty title, or a
+DOI that resolves without readable metadata, reports `UNCHECKABLE` and says why. Comparing a
+cited title against an empty one scores 0.00, which used to read as `MISMATCH`.
+
 **A parser failure is not a clean bill of health.** If a file plainly contains citations and
 zero are parsed, that is reported as a hard failure rather than "0 fabricated." Silent
 degradation into a reassuring green is the specific failure this tool exists to prevent.

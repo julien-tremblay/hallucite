@@ -54,6 +54,12 @@ TIMEOUT = 12
 # matching and came back OK; and the French "erreur" does not contain "error". A sentinel is
 # checked, not guessed at.
 NO_ORACLE = "oracle unavailable: "
+# Distinct from NO_ORACLE, and deliberately so. NO_ORACLE means the registry FAILED to
+# answer, which is transient and must fail the gate. This means the registry answered
+# correctly and the record itself has no comparable title: a permanent data gap on their
+# side, not a defect in the bibliography, so it is soft and does not fail the gate. Both
+# stop verify() from falling through to a weaker check, for opposite reasons.
+NO_TITLE = "resolved but unverifiable: "
 # arXiv id: new-style 2101.01234[v2] OR old-style quant-ph/0101012, math.AG/0512013
 ARXIV_RE = r"(\d{4}\.\d{4,5}|[a-z-]+(?:\.[A-Z]{2})?/\d{7})"
 # Crossref restricted the DOI suffix charset in 2008 but never invalidated what was already
@@ -113,6 +119,25 @@ def _get(url, accept="application/json"):
     raise urllib.error.URLError("retries exhausted")  # pragma: no cover
 
 
+# `{\'e}`, `\'{e}`, `\'e` and `{\c c}` all mean one letter. norm() mapped the backslash and
+# braces to spaces, so `S{\'e}minaire de g{\'e}om{\'e}trie` tokenised as
+# ["s","e","minaire","de","g","e","om","e","trie"] -- every accented word shattered into
+# fragments. A real SGA volume scored 0.53 against its own registry record and was reported
+# MISMATCH. French and German bibliographies are full of these. Found by running the sweep
+# over a private corpus, 2026-09-02; three rounds of hand-built fixtures missed it.
+_TEX_ACCENT = [
+    re.compile(r"\{\\[a-zA-Z`'^\"~=.]+\s*\{?([A-Za-z])\}?\}"),  # {\'e}  {\c c}  {\c{c}}
+    re.compile(r"\\[a-zA-Z]+\s*\{([A-Za-z])\}"),                  # \c{c}  \v{s}
+    re.compile(r"\\[`'^\"~=.]\s*\{?([A-Za-z])\}?"),               # \'e  \'{e}  \"u
+]
+
+
+def _untex(s):
+    for rx in _TEX_ACCENT:
+        s = rx.sub(r"\1", s)
+    return s
+
+
 def norm(s):
     """Fold a title to comparable tokens.
 
@@ -125,7 +150,7 @@ def norm(s):
     the registry's `Über`; str.isalnum is Unicode-aware, so every other script survives
     intact and compares against itself.
     """
-    s = unicodedata.normalize("NFKD", (s or "").casefold())
+    s = unicodedata.normalize("NFKD", _untex(s or "").casefold())
     s = "".join(c for c in s if not unicodedata.combining(c))
     return "".join(c if c.isalnum() else " " for c in s).split()
 
@@ -438,6 +463,11 @@ def check_doi(doi, claimed_title):
     found = (msg.get("title") or [""])[0]
     if not claimed_title:
         return "OK", f"DOI resolves: {found[:70]}"
+    if not found.strip():
+        # Crossref records do occasionally carry an empty title (chapoton_livernet_2001,
+        # a real IMRN 2001 paper with a correct DOI). Comparing against "" scores 0.00 and
+        # read as MISMATCH: the registry's gap became an accusation against the author.
+        return "UNCHECKABLE", NO_TITLE + f"{doi} resolves, but the registry record has no title"
     r = title_match(claimed_title, found)
     return (
         ("OK", f"DOI resolves, title match {r:.2f}")
@@ -567,6 +597,11 @@ def verify(ref):
     if ref["doi"]:
         cls, why = check_doi(ref["doi"], ref["title"])
         if cls != "UNCHECKABLE":
+            return cls, why
+        if why.startswith(NO_TITLE):
+            # The DOI resolved: the reference is not fabricated, and no weaker check can
+            # add to that. Falling through reported "no close Crossref match", which
+            # describes the wrong thing entirely.
             return cls, why
         if why.startswith(NO_ORACLE):
             degraded = "DOI " + why

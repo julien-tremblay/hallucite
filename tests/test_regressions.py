@@ -286,5 +286,36 @@ cls, _ = H.verify({"doi": "", "arxiv": "", "year": "", "title": "Science of Logi
 check("...but an exact title-only match still clears", cls == "OK", f"got {cls}")
 H._get = _real_get
 
+
+# --- round 4: found by sweeping a private corpus, not by a fixture -------------
+
+# 21. `{\'e}`, `\'{e}`, `\'e` and `{\c c}` all mean one letter, but norm() mapped the
+#     backslash and braces to spaces, so `S{\'e}minaire de g{\'e}om{\'e}trie` tokenised as
+#     ["s","e","minaire","de","g","e","om","e","trie"] -- every accented word shattered.
+#     A real SGA volume scored 0.53 against its own registry record and was reported
+#     MISMATCH. French and German bibliographies are full of these.
+check("LaTeX accent escapes do not shatter words",
+      H.norm(r"S{\'e}minaire de g{\'e}om{\'e}trie")[:3] == ["seminaire", "de", "geometrie"],
+      f"got {H.norm(chr(83) + chr(123) + chr(92) + chr(39) + 'e}minaire')[:3]}")
+for form, plain in [(r"Poincar{\'e} recurrence", "Poincar\u00e9 recurrence"),
+                    (r'{\"U}ber die Quantenmechanik', "\u00dcber die Quantenmechanik"),
+                    (r"Fran{\c c}ois et le th{\'e}or{\`e}me", "Fran\u00e7ois et le th\u00e9or\u00e8me"),
+                    (r"\v{S}koda's theorem", "\u0160koda's theorem")]:
+    check(f"accent form {form[:14]!r} matches its plain text",
+          H.title_match(form, plain) >= 0.90, f"got {H.title_match(form, plain):.2f}")
+check("the fold does not make everything match",
+      H.title_match("penguins on the moon", "Continuous Variable Quantum Cryptography") < 0.60)
+
+# 22. Crossref records do occasionally carry an EMPTY title. chapoton_livernet_2001 is a
+#     real IMRN 2001 paper with a correct DOI whose registry record has none. Comparing
+#     against "" scores 0.00 and read as MISMATCH: the registry's gap became an accusation
+#     against the author.
+H._get = lambda u, accept="application/json": (
+    _j2.dumps({"message": {"title": [""], "DOI": "10.1155/s1073792801000198"}}), 200)
+cls, why = H.verify({"doi": "10.1155/s1073792801000198", "arxiv": "", "year": "",
+                     "title": "Pre-Lie algebras and the rooted trees operad", "key": "c"})
+check("an empty registry title is UNCHECKABLE, not MISMATCH", cls == "UNCHECKABLE", f"got {cls}: {why}")
+H._get = _real_get
+
 print(f"\n{'ALL PASS' if not FAILS else str(len(FAILS)) + ' FAILED: ' + ', '.join(FAILS)}")
 sys.exit(0 if not FAILS else 1)
