@@ -3,7 +3,7 @@
 
 Motivation (2026-07-11 research digest): the HALLMARK study found a deterministic bibtex/DOI
 verifier (F1 0.908) BEATS the best zero-shot LLM (0.840) at catching fabricated citations, and
-giving the LLM tool access made it WORSE. Internal history: a draft paper shipped fabricated refs.
+giving the LLM tool access made it WORSE.
 So this is a $0, no-LLM, network-only check that resolves every reference against the authoritative
 registries (Crossref for DOIs/titles, arXiv for eprints) and classifies it.
 
