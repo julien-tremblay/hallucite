@@ -145,8 +145,13 @@ check("...and it is flagged with the machine-readable sentinel", why.startswith(
 HERE = pathlib.Path(__file__).resolve().parent
 bib = HERE / "_gate_tmp.bib"
 bib.write_text("@article{a,\n  title = {T},\n  doi = {10.9999/nope}\n}\n")
-off = dict(**__import__("os").environ, http_proxy="http://127.0.0.1:9",
-           https_proxy="http://127.0.0.1:9")
+# Built by update, not dict(**environ, https_proxy=...): that raised TypeError on any machine
+# that already had https_proxy set, so the suite crashed instead of reporting. Every proxy
+# variable is dropped first, since no_proxy or an uppercase twin could route around the
+# blackhole and turn this into a network test.
+off = {k: v for k, v in __import__("os").environ.items()
+       if not k.lower().endswith("_proxy")}
+off.update(http_proxy="http://127.0.0.1:9", https_proxy="http://127.0.0.1:9")
 rc = subprocess.run([sys.executable, str(HERE.parent / "hallucite.py"), str(bib), "--gate"],
                     capture_output=True, env=off).returncode
 check("--gate fails closed when no registry answers", rc == 1, f"got exit {rc}")
@@ -316,6 +321,122 @@ cls, why = H.verify({"doi": "10.1155/s1073792801000198", "arxiv": "", "year": ""
                      "title": "Pre-Lie algebras and the rooted trees operad", "key": "c"})
 check("an empty registry title is UNCHECKABLE, not MISMATCH", cls == "UNCHECKABLE", f"got {cls}: {why}")
 H._get = _real_get
+
+
+# --- round 5: 2026-09-25 adversarial pass ---------------------------------------------
+
+# 23. Reference managers write the doi field as a resolver URL (http://dx.doi.org/...)
+#     or with a `doi:` prefix. Only https://doi.org/ was stripped, so the whole URL went to
+#     the registry, 404'd everywhere, and a real paper was BAD-DOI -- or FABRICATED when it
+#     carried no title to rescue it.
+for form in ["http://dx.doi.org/10.1038/nature14539", "https://dx.doi.org/10.1038/nature14539",
+             "doi:10.1038/nature14539", "DOI: 10.1038/nature14539",
+             "https://doi.org/10.1038%2Fnature14539"]:
+    r = H.parse_bib("@article{a,\n  title = {Deep learning},\n  doi = {%s}\n}\n" % form)
+    check(f"doi field {form[:22]!r} normalises", r and r[0]["doi"] == "10.1038/nature14539",
+          f"got {r and r[0]['doi']!r}")
+
+# 24. An entry missing its closing brace was skipped: it vanished from the count, and a
+#     fabricated DOI inside it passed --gate. A file truncated mid-entry passed as "no
+#     references found". Both must surface as parser failures, and the neighbours must
+#     still be read.
+r = H.parse_bib("@article{a,\n  title = {T},\n  doi = {10.9999/fake}\n\n"
+                "@article{b,\n  title = {U},\n  doi = {10.1/y}\n}\n")
+check("an unterminated entry is reported, not dropped",
+      [x["key"] for x in r] == ["a", "b"] and r[0].get("error") and not r[1].get("error"),
+      f"got {[(x['key'], x.get('error')) for x in r]}")
+trunc = HERE / "_trunc_tmp.bib"
+trunc.write_text("@book{a,\n  title = {T},\n  doi = {10.9999/fake}\n")
+p = subprocess.run([sys.executable, HAL, str(trunc), "--gate"], capture_output=True,
+                   text=True, env=off)
+trunc.unlink()
+check("a bib truncated mid-entry fails the gate as a parser failure",
+      p.returncode == 1 and "[PARS]" in p.stdout, f"got exit {p.returncode}: {p.stdout!r}")
+
+# 25. The arXiv fallback ran a bare ARXIV_RE over the whole entry whenever "arxiv" appeared,
+#     and read `2020.0063` out of the DOI 10.1098/rspa.2020.0063. With Crossref down, that
+#     invented id was the one checked -- and came back FABRICATED, during an outage.
+r = H.parse_bib("@article{a,\n  title = {T},\n  doi = {10.1098/rspa.2020.0063},\n"
+                "  note = {also on arXiv}\n}\n")
+check("the arXiv fallback does not read digits out of a DOI", r and r[0]["arxiv"] == "",
+      f"got {r and r[0]['arxiv']!r}")
+for form in ["journal = {arXiv preprint arXiv:1706.03762}",
+             "url = {https://arxiv.org/abs/1706.03762}",
+             "doi = {10.48550/arXiv.1706.03762}"]:
+    r = H.parse_bib("@misc{a,\n  title = {Attention Is All You Need},\n  %s\n}\n" % form)
+    check(f"...but still finds {form[:24]!r}", r and r[0]["arxiv"] == "1706.03762",
+          f"got {r and r[0]['arxiv']!r}")
+
+# 26. The empty-registry-title guard (22) was added to the Crossref branch only. A DataCite
+#     record without a title, reached via doi.org, still scored 0.00 and read MISMATCH.
+def _nocref(csl):
+    def g(u, accept="application/json"):
+        if "api.crossref.org/works/" in u:
+            raise urllib_error.HTTPError(u, 404, "nf", {}, None)
+        return _j2.dumps(csl), 200
+    return g
+H._get = _nocref({"title": ""})
+cls, why = H.verify({"doi": "10.5281/zenodo.1", "arxiv": "", "year": "",
+                     "title": "A Real Dataset", "key": "z"})
+check("an empty non-Crossref title is UNCHECKABLE, not MISMATCH",
+      cls == "UNCHECKABLE" and why.startswith(H.NO_TITLE), f"got {cls}: {why}")
+H._get = _nocref({"title": "Something Else"})
+cls, _ = H.verify({"doi": "10.5281/zenodo.1", "arxiv": "", "year": "",
+                   "title": "Penguins on the moon", "key": "z"})
+check("...and a different non-Crossref title is still MISMATCH", cls == "MISMATCH", f"got {cls}")
+H._get = _real_get
+
+# 27. arXiv answers a malformed id with an ENTRY titled "Error" whose <id> points at
+#     /api/errors. Read as a record, an inline fabricated id was "OK arXiv resolves: Error".
+#     And a dead arXiv id carrying a real title was a flat FABRICATED, which the DOI path
+#     had stopped doing: a dead identifier is not a dead reference.
+ERR = ("<feed><entry><id>http://arxiv.org/api/errors#incorrect_id_format_for_1234.5678</id>"
+       "<title>Error</title><summary>incorrect id format for 1234.5678</summary></entry></feed>")
+
+
+def _arx(feed, best_title=None):
+    def g(u, accept="application/json"):
+        if "export.arxiv.org" in u:
+            return feed, 200
+        return _j2.dumps({"message": {"items": [{"title": [best_title]}] if best_title else []}}), 200
+    return g
+
+
+H._get = _arx(ERR)
+cls, why = H.verify({"doi": "", "arxiv": "1234.5678", "year": "", "title": "", "key": "a"})
+check("an arXiv error entry is not a record", cls == "FABRICATED", f"got {cls}: {why}")
+H._get = _arx("<feed></feed>", best_title="Attention Is All You Need")
+cls, why = H.verify({"doi": "", "arxiv": "1706.99999", "year": "",
+                     "title": "Attention Is All You Need", "key": "a"})
+check("a real paper with a dead arXiv id is BAD-DOI, not FABRICATED", cls == "BAD-DOI",
+      f"got {cls}: {why}")
+H._get = _arx("<feed></feed>", best_title="Something About Penguins")
+cls, _ = H.verify({"doi": "", "arxiv": "1706.99999", "year": "",
+                   "title": "Quantum Marmalade Bathymetry", "key": "a"})
+check("...and an invented one is still FABRICATED", cls == "FABRICATED", f"got {cls}")
+H._get = _real_get
+
+# 28. Only `\cite{` and two entry types counted as citation markers, so a paper citing with
+#     natbib's \citep, and a .bib whose entries are all @book, reported "no citation
+#     markers" and passed --gate having checked nothing.
+for name, text in [("\\citep", "As shown \\citep{smith2020}."),
+                   ("\\parencite", "As shown \\parencite[p.~3]{smith2020}."),
+                   ("pandoc", "As shown [@smith2020]."),
+                   ("@book", "@book{a,\n  author = {X}\n")]:
+    f = HERE / "_marker_tmp.tex"
+    f.write_text(text)
+    p = subprocess.run([sys.executable, HAL, str(f), "--gate"], capture_output=True,
+                       text=True, env=off)
+    f.unlink()
+    check(f"{name} counts as a citation marker", p.returncode == 1 and "[PARS]" in p.stdout,
+          f"got exit {p.returncode}: {p.stdout.strip()!r}")
+# ...without making ordinary LaTeX internals look like citations.
+f = HERE / "_marker_tmp.tex"
+f.write_text("\\makeatletter\\def\\x{\\@ifnextchar{[}{a}{b}}\\makeatother\nNo refs, mail a@b.org.")
+p = subprocess.run([sys.executable, HAL, str(f), "--gate"], capture_output=True, env=off)
+f.unlink()
+check("\\@ifnextchar and an email are not citation markers", p.returncode == 0,
+      f"got exit {p.returncode}")
 
 print(f"\n{'ALL PASS' if not FAILS else str(len(FAILS)) + ' FAILED: ' + ', '.join(FAILS)}")
 sys.exit(0 if not FAILS else 1)

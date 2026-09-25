@@ -21,7 +21,7 @@ $ hallucite paper.bib
   [SUSP] smith2019book      no close Crossref match for title
   [??? ] internal2024       no DOI, arXiv id, or usable title
 
-summary: 2 hard (fabricated/mismatch), 3 soft (suspect/uncheckable)
+summary: 2 hard (fabricated/mismatch/unparsed), 3 soft (suspect/uncheckable)
 ```
 
 ## Install
@@ -107,8 +107,8 @@ to fill the gap. A verifier that cries fraud during a network outage is worse th
 verifier, because you stop trusting it exactly when it is right.
 
 **A dead identifier is not a dead reference.** Publishers mistype, retire and never register
-DOIs for work that plainly exists, so a DOI that resolves nowhere is checked against its
-title before any verdict is passed. If the paper is real, you get `BAD-DOI`, which says fix
+DOIs for work that plainly exists, so a DOI or arXiv id that resolves nowhere is checked
+against its title before any verdict is passed. If the paper is real, you get `BAD-DOI`, which says fix
 the identifier, not `FABRICATED`, which says you made this up. ACM's `10.5555/*` range is the
 case that matters: `10.5555/3295222.3295349` is *Attention Is All You Need*, and it 404s.
 The bar for that rescue is 0.90 rather than the 0.60 used elsewhere, because a fabricated
@@ -125,7 +125,8 @@ DOI that resolves without readable metadata, reports `UNCHECKABLE` and says why.
 cited title against an empty one scores 0.00, which used to read as `MISMATCH`.
 
 **A parser failure is not a clean bill of health.** If a file plainly contains citations and
-zero are parsed, that is reported as a hard failure rather than "0 fabricated." Silent
+zero are parsed, that is reported as a hard failure rather than "0 fabricated." So is a
+bibtex entry with no closing brace, which used to vanish from the count. Silent
 degradation into a reassuring green is the specific failure this tool exists to prevent.
 
 **Deterministic beats a model here.** The HALLMARK study found a deterministic DOI/bibtex
@@ -167,8 +168,9 @@ with a concrete case, that is a bug report I can act on.
    to satisfy cases I had, not derived from anything.
 4. **Break the parsers.** `.bbl`, RIS, Zotero and Mendeley exports, biblatex `@online`,
    `crossref`-inherited fields, and `@string` macros are all untested. A file that plainly
-   contains references and yields zero is reported as a parser failure, but a file that
-   yields *some* is not, and silent partial loss is the defect this tool exists to prevent.
+   contains references and yields zero is reported as a parser failure, and so is an
+   unterminated bibtex entry, but a `\bibitem` or inline reference the parser skips is not,
+   and silent partial loss is the defect this tool exists to prevent.
 5. **Argue with `BAD-DOI`.** Splitting "this identifier is dead" from "this paper does not
    exist" may be over-generous. A fabricated reference carrying a plausible real title gets
    downgraded from `FABRICATED` to a warning, and I am not certain 0.90 is high enough.

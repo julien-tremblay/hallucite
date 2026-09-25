@@ -199,8 +199,11 @@ def title_match(a, b):
 
 
 # ---- reference extraction --------------------------------------------------
+_NEXT_ENTRY = re.compile(r"\n[ \t]*@\w+\s*\{")
+
+
 def _entries(text):
-    """Yield (etype, key, body) for each @entry, counting braces.
+    """Yield (etype, key, body, closed) for each @entry, counting braces.
 
     The old regex required the closing brace to start a line. An indented `  }`, a `}}`
     riding on the last field's line, and a one-line entry were all INVISIBLE, and an
@@ -208,26 +211,31 @@ def _entries(text):
     Measured 2026-09-02: a two-entry file whose second entry carried a fabricated DOI and
     an indented closing brace passed --gate with exit 0. Silent partial loss is the exact
     failure this tool exists to prevent, so the scanner must not depend on layout.
+
+    An entry missing its closing brace was skipped outright, so it vanished from the count
+    and a fabricated DOI inside it passed --gate; a file truncated mid-entry passed as "no
+    references found". The scan now also stops at the next line-initial `@type{`, and an
+    unclosed entry is yielded with closed=False so the caller can report it.
     """
     for m in re.finditer(r"@(\w+)\s*\{", text):
         i = m.end()
+        nxt = _NEXT_ENTRY.search(text, i)
+        stop = nxt.start() if nxt else len(text)
         depth, j = 1, i
-        while j < len(text) and depth:
+        while j < stop and depth:
             if text[j] == "{":
                 depth += 1
             elif text[j] == "}":
                 depth -= 1
             j += 1
-        if depth:
-            continue  # unterminated entry: truncated file
-        key, _, body = text[i : j - 1].partition(",")
-        yield m.group(1).lower(), key.strip(), body
+        key, _, body = text[i : j - 1 if not depth else j].partition(",")
+        yield m.group(1).lower(), key.strip(), body, not depth
 
 
 def parse_bib(text):
     """Yield dicts for each @entry with the fields we can verify."""
     refs = []
-    for etype, key, body in _entries(text):
+    for etype, key, body, closed in _entries(text):
         # The old bibtex entry regex stopped before the final newline while field()
         # required a trailing one, so the LAST field of every entry was invisible.
         # Worst case: when title came last it parsed as empty, check_doi took the
@@ -236,6 +244,11 @@ def parse_bib(text):
         # `control` is REVTeX's bookkeeping entry (@CONTROL{REVTEX42Control}); it carries
         # no reference. It only became visible once the scanner stopped needing a newline.
         if etype in ("comment", "string", "preamble", "control") or not body.strip():
+            continue
+        if not closed:
+            refs.append({"key": key, "type": etype, "doi": "", "arxiv": "", "title": "",
+                         "year": "", "error": "entry has no closing brace, so its fields "
+                         "cannot be read reliably"})
             continue
         body += "\n"
 
@@ -270,7 +283,12 @@ def parse_bib(text):
                 return re.sub(r"\s+", " ", body[i + 1 : j - 1]).strip()
             return body[i:].split(",")[0].strip()
 
-        doi = clean_doi(field("doi"))
+        # Reference managers write the field as a resolver URL (`http://dx.doi.org/...`)
+        # or with a `doi:` prefix. Only `https://doi.org/` was stripped,
+        # so every other form went to the registry verbatim, 404'd everywhere, and a real
+        # paper came back BAD-DOI, or FABRICATED when it had no title to rescue it.
+        dm = re.search(DOI_RE, urllib.parse.unquote(field("doi")))
+        doi = clean_doi(dm.group(0)) if dm else ""
         if not doi:
             # @misc entries routinely park the DOI in `note` or `howpublished` rather than
             # a `doi` field. The arXiv branch below already falls back to scanning the
@@ -283,15 +301,19 @@ def parse_bib(text):
         # arXiv id: new-style (2101.01234) OR old-style (quant-ph/0101012, math.AG/0512013)
         arxiv = ""
         am = re.search(ARXIV_RE, eprint)
-        if not am and "arxiv" in body.lower():
-            am = re.search(ARXIV_RE, body)
+        if not am:
+            # The scan must anchor on an arXiv marker. A bare ARXIV_RE over the whole entry
+            # read `2020.0063` out of the DOI 10.1098/rspa.2020.0063 whenever "arxiv"
+            # appeared anywhere, and during a Crossref outage that invented id was the one
+            # checked, and came back FABRICATED.
+            am = re.search(r"(?:arxiv[.:]?\s*|arxiv\.org/(?:abs|pdf)/)" + ARXIV_RE, body, re.I)
         if am:
             arxiv = am.group(1)
         refs.append(
             {
                 "key": key,
                 "type": etype,
-                "doi": doi.lower().replace("https://doi.org/", ""),
+                "doi": doi.lower(),
                 "arxiv": arxiv,
                 "title": field("title"),
                 "year": field("year"),
@@ -442,6 +464,10 @@ def check_doi(doi, claimed_title):
             found = found[0] if found else ""
         if not claimed_title:
             return "OK", f"DOI resolves via a non-Crossref agency: {found[:60]}"
+        if not str(found).strip():
+            # Same registry gap as the Crossref branch below, which was fixed there only:
+            # comparing against "" scores 0.00 and a correct DataCite citation read MISMATCH.
+            return "UNCHECKABLE", NO_TITLE + f"{doi} resolves, but the registry record has no title"
         r = title_match(claimed_title, found)
         return (
             ("OK", f"DOI resolves (non-Crossref agency), title match {r:.2f}")
@@ -487,8 +513,12 @@ def check_arxiv(aid, claimed_title):
     except Exception as e:  # noqa: BLE001
         return "UNCHECKABLE", NO_ORACLE + f"arXiv {type(e).__name__}"
     entries = re.findall(r"<entry>(.*?)</entry>", body, re.S)
-    if not entries:
-        return "FABRICATED", f"arXiv:{aid} has no record"
+    # arXiv answers a malformed id (`1234.5678`: there is no month 34) with an ENTRY whose
+    # <id> points at /api/errors and whose <title> is "Error". Read as a record, an inline
+    # fabricated id came back "OK arXiv resolves: Error", and a titled one MISMATCH against
+    # the word "Error". Either way the id resolves nowhere, which _unresolvable decides.
+    if not entries or "/api/errors" in entries[0]:
+        return _unresolvable(f"arXiv:{aid}", claimed_title, f"arXiv:{aid} has no record")
     tm = re.search(r"<title>(.*?)</title>", entries[0], re.S)
     found = re.sub(r"\s+", " ", tm.group(1)).strip() if tm else ""
     if not claimed_title:
@@ -546,8 +576,8 @@ def check_title(title):
     )
 
 
-def _unresolvable(doi, claimed_title):
-    """A DOI that resolves nowhere. Is the REFERENCE invented, or only the identifier?
+def _unresolvable(doi, claimed_title, dead=None):
+    """An identifier that resolves nowhere. Is the REFERENCE invented, or only the identifier?
 
     ACM's `10.5555/*` proceedings range is the standard case: `10.5555/3295222.3295349` is
     "Attention Is All You Need", it 404s at doi.org, and a flat FABRICATED verdict therefore
@@ -560,8 +590,11 @@ def _unresolvable(doi, claimed_title):
     0.90 rather than the 0.60 used elsewhere because a fabricated reference almost always
     carries a plausible title, and a loose bar would launder exactly what this tool exists
     to catch.
+
+    A dead arXiv id takes the same path: a real paper cited with a mistyped eprint number
+    was a flat FABRICATED, which the DOI branch had stopped doing for the same reason.
     """
-    dead = f"DOI {doi} does not resolve at doi.org (all registration agencies)"
+    dead = dead or f"DOI {doi} does not resolve at doi.org (all registration agencies)"
     if not claimed_title:
         return "FABRICATED", dead
     best, found = _title_lookup(claimed_title)
@@ -571,7 +604,7 @@ def _unresolvable(doi, claimed_title):
         return "UNCHECKABLE", f"{found} -- {doi} resolves nowhere, title unverified"
     if best >= IDENTITY:
         return "BAD-DOI", (f"the paper is real (Crossref match {best:.2f}: "
-                           f"'{found[:50]}') but DOI {doi} resolves nowhere: wrong, "
+                           f"'{found[:50]}') but {doi if dead.startswith('arXiv') else 'DOI ' + doi} resolves nowhere: wrong, "
                            f"retired or never-registered identifier")
     return "FABRICATED", f"{dead}, and no Crossref record matches the title (best {best:.2f})"
 
@@ -697,7 +730,8 @@ def selftest():
             "OK",
         ),
         (
-            {"doi": "", "arxiv": "9999.99999", "title": "Nonexistent", "key": "t4"},
+            {"doi": "", "arxiv": "9999.99999", "key": "t4",
+             "title": "Quantum Marmalade Bathymetry in Cislunar Systems"},
             "FABRICATED",
         ),
         (
@@ -802,9 +836,12 @@ def main():
             # A file that clearly HAS references but yielded none is a parser
             # failure, not a clean bill of health. Reporting "0 fabricated"
             # there is the exact silent-degradation this tool exists to prevent.
-            has_markers = bool(
-                re.search(r"\\cite\{|\\bibitem|@article|@inproceedings", text)
-            )
+            # `\cite{` alone missed natbib and biblatex (`\citep`, `\parencite`, `\cite[p.~3]{`),
+            # pandoc's `[@key]`, and every entry type but two, so a paper citing with \citep
+            # and a .bib truncated inside an @book both passed --gate having checked nothing.
+            has_markers = bool(re.search(
+                r"\\[A-Za-z]*cite[A-Za-z]*\*?\s*(?:\[[^\]]*\]\s*)*\{|\\bibitem"
+                r"|(?<![\\\w])@[A-Za-z]+\s*\{|\[-?@[A-Za-z_]", text))
             if has_markers and not any_refs:
                 print(f"\n== {path} ==")
                 print(
@@ -819,6 +856,12 @@ def main():
             continue
         print(f"\n== {path} ({len(refs)} refs) ==")
         for ref in refs:
+            if ref.get("error"):
+                # A reference the parser could not read is a parser failure, reported as
+                # hard for the same reason the zero-references case is.
+                print(f"  [PARS] {ref['key'][:40]:40s} {ref['error']}")
+                hard += 1
+                continue
             cls, why = verify(ref)
             if cls in ("FABRICATED", "MISMATCH"):
                 hard += 1
@@ -837,7 +880,7 @@ def main():
             print(f"  [{icon}] {ref['key'][:40]:40s} {why}")
             time.sleep(0.25)  # be polite to Crossref/arXiv
     print(
-        f"\nsummary: {hard} hard (fabricated/mismatch), {soft} soft (suspect/uncheckable)"
+        f"\nsummary: {hard} hard (fabricated/mismatch/unparsed), {soft} soft (suspect/uncheckable)"
         + (f", {degraded} UNVERIFIED (registry unreachable)" if degraded else "")
     )
     if degraded:
