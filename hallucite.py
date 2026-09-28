@@ -159,10 +159,53 @@ _TEX_ACCENT = [
 ]
 
 
+# Letters TeX spells as commands. {\o}, {\ss}, {\L} and the dotless \i in `\'{\i}` (the
+# standard way to write í) matched none of the accent patterns, so `Bj{\o}rn` shattered into
+# "bj o rn" and `F\'{\i}sica` into "f i sica". The (?![A-Za-z]) keeps `\it` and `\label` out.
+_TEX_LETTERS = {"o": "ø", "O": "Ø", "ae": "æ", "AE": "Æ", "oe": "œ", "OE": "Œ", "aa": "å",
+                "AA": "Å", "ss": "ß", "l": "ł", "L": "Ł", "i": "i", "j": "j"}
+_TEX_LETTER = re.compile(r"\{?\\(" + "|".join(sorted(_TEX_LETTERS, key=len, reverse=True))
+                         + r")(?![A-Za-z])\s*\}?")
+_GREEK = ("alpha beta gamma delta epsilon varepsilon zeta eta theta vartheta iota kappa lambda "
+          "mu nu xi pi varpi rho varrho sigma varsigma tau upsilon phi varphi chi psi omega "
+          "Gamma Delta Theta Lambda Xi Pi Sigma Upsilon Phi Psi Omega").split()
+_GREEK_CHAR = dict(zip(_GREEK, "αβγδεεζηθθικλμνξππρρσςτυφφχψωΓΔΘΛΞΠΣΥΦΨΩ"))
+_TEX_GREEK = re.compile(r"\\(" + "|".join(sorted(_GREEK, key=len, reverse=True)) + r")(?![A-Za-z])")
+# Font and text commands carry no letters of their own: `\emph{Title}` is "Title".
+_TEX_FONT = re.compile(r"\\(?:emph|text(?:it|bf|sl|sc|rm|tt|sf|up|normal)?|math(?:rm|bf|it|cal|bb|"
+                       r"sf|tt|frak|scr)?|mbox|ensuremath|boldsymbol|operatorname)\s*|"
+                       r"(?<=\{)\\(?:em|it|bf|sl|sc|rm|tt|sf)\b\s*")
+# Crossref titles carry JATS, HTML and MathML markup: `CO<sub>2</sub>`, `<i>E. coli</i>`,
+# whole <mml:math> trees. A bibliography writes `CO$_2$`. Tags are deleted, not spaced, so
+# both sides become "CO2"; the TeX copy that JATS keeps beside a formula is dropped so the
+# formula is not counted twice. The benchmark could not see any of this: it copies the
+# registry's own title, markup and all, into the bibliography. Audit 2026-09-28.
+_MARKUP = re.compile(
+    r"<((?:[a-z]+:)?(?:tex-math|annotation))\b[^>]*>.*?</\1>"
+    r"|</?(?:[a-z]+:)?(?:i|b|em|strong|sub|sup|sc|scp|u|span|p|br|italic|bold|monospace|"
+    r"underline|inline-formula|alternatives|math|mi|mn|mo|ms|mtext|mspace|msub|msup|msubsup|"
+    r"mrow|mfrac|mover|munder|munderover|mstyle|mfenced|msqrt|mroot|mpadded|mphantom|"
+    r"semantics|none|mprescripts|mmultiscripts|mtable|mtr|mtd)\b[^>]*>", re.I | re.S)
+
+
+def _math(m):
+    """Inline math, folded to the characters it prints: `$_2$` is "2", `$\alpha$` is "α"."""
+    inner = _TEX_GREEK.sub(lambda g: _GREEK_CHAR[g.group(1)], m.group(1))
+    inner = _TEX_FONT.sub("", inner)
+    return re.sub(r"[{}_^\s]|\\[,;:!]", "", inner)
+
+
 def _untex(s):
+    s = re.sub(r"\$([^$]{0,200})\$", _math, s)
+    s = _TEX_LETTER.sub(lambda m: _TEX_LETTERS[m.group(1)], s)
     for rx in _TEX_ACCENT:
         s = rx.sub(r"\1", s)
-    return s
+    s = _TEX_GREEK.sub(lambda g: _GREEK_CHAR[g.group(1)], s)
+    s = _TEX_FONT.sub("", s)
+    # Braces group; they never separate words. Mapped to spaces, as they were, the case
+    # protection in `A Primer in {BERT}ology` split the word, and "bert ology" no longer
+    # matched the registry's "BERTology".
+    return s.replace("{", "").replace("}", "")
 
 
 def norm(s):
@@ -177,7 +220,8 @@ def norm(s):
     the registry's `Über`; str.isalnum is Unicode-aware, so every other script survives
     intact and compares against itself.
     """
-    s = unicodedata.normalize("NFKD", _untex(s or "").casefold())
+    s = _untex(html.unescape(_MARKUP.sub("", s or "")))
+    s = unicodedata.normalize("NFKD", s.casefold())
     s = "".join(c for c in s if not unicodedata.combining(c))
     return "".join(c if c.isalnum() else " " for c in s).split()
 
@@ -187,7 +231,7 @@ def _ordered_coverage(ta, tb):
     short, lng = (ta, tb) if len(ta) <= len(tb) else (tb, ta)
     if not short:
         return 0.0
-    sm = difflib.SequenceMatcher(None, short, lng)
+    sm = difflib.SequenceMatcher(None, short, lng, autojunk=False)
     return sum(b.size for b in sm.get_matching_blocks()) / len(short)
 
 
@@ -221,8 +265,39 @@ def title_match(a, b):
     ta, tb = norm(a), norm(b)
     if not ta or not tb:
         return 0.0
-    seq = difflib.SequenceMatcher(None, " ".join(ta), " ".join(tb)).ratio()
+    # autojunk=False: with the default, difflib treats every character that makes up more
+    # than 1% of a sequence of 200 or more as junk. For a joined title that long that is
+    # the space and most vowels, so a one-word edit to a 250-character clinical-trial title
+    # scored 0.54 instead of 0.99, and such a title could never clear the 0.90 bar that
+    # rescues a real paper from a dead DOI. Audit 2026-09-28.
+    seq = difflib.SequenceMatcher(None, " ".join(ta), " ".join(tb), autojunk=False).ratio()
     return max(seq, _CONTAINMENT_CEILING * _ordered_coverage(ta, tb))
+
+
+def _record_titles(rec):
+    """Every title a registry record (Crossref or CSL-JSON) carries, first title first.
+
+    Crossref splits `Title: Subtitle` across `title` and `subtitle`, and keeps the
+    original-language title in its own field. Only title[0] was read, so a reference citing
+    the full title scored 0.85 against the bare one -- below the 0.90 bar, so a real paper
+    with a dead DOI was FABRICATED -- and one citing a paper by its original title read
+    against the translation. Short titles are left out on purpose: "BERT" matching "BERT"
+    would certify identity at the bar a fabricated reference must not clear. Audit
+    2026-09-28.
+    """
+    def strs(v):
+        if isinstance(v, str):
+            return [v]
+        return [x for x in v if isinstance(x, str)] if isinstance(v, list) else []
+    titles, subs = strs(rec.get("title")), strs(rec.get("subtitle"))
+    out = titles + ([f"{titles[0]}: {subs[0]}"] if titles and subs else [])
+    out += strs(rec.get("original-title"))
+    return [t for t in out if t.strip()]
+
+
+def _best_title(claimed, titles):
+    """(score, title) of the registry title closest to the cited one."""
+    return max(((title_match(claimed, t), t) for t in titles), default=(0.0, ""))
 
 
 # ---- reference extraction --------------------------------------------------
@@ -600,16 +675,16 @@ def check_doi(doi, claimed_title):
         # A 200 carrying an HTML maintenance or captcha page. This is an outage wearing a
         # success code, and it must poison the result rather than fall through.
         return "UNCHECKABLE", NO_ORACLE + "Crossref returned non-JSON (error page?)"
-    msg = _j.get("message", {})
-    found = (msg.get("title") or [""])[0]
+    titles = _record_titles(_j.get("message", {}))
+    found = titles[0] if titles else ""
     if not claimed_title:
         return "OK", f"DOI resolves: {found[:70]}"
-    if not found.strip():
+    if not titles:
         # Crossref records do occasionally carry an empty title (chapoton_livernet_2001,
         # a real IMRN 2001 paper with a correct DOI). Comparing against "" scores 0.00 and
         # read as MISMATCH: the registry's gap became an accusation against the author.
         return "UNCHECKABLE", NO_TITLE + f"{doi} resolves, but the registry record has no title"
-    r = title_match(claimed_title, found)
+    r, found = _best_title(claimed_title, titles)
     return (
         ("OK", f"DOI resolves, title match {r:.2f}")
         if r >= 0.6
@@ -661,21 +736,18 @@ def _check_doi_elsewhere(doi, claimed_title):
     try:
         b, _ = _get(f"https://doi.org/{urllib.parse.quote(doi)}",
                     accept="application/vnd.citationstyles.csl+json")
-        csl = json.loads(b)
-        found = csl.get("title") or ""
+        titles = _record_titles(json.loads(b))
     except Exception:  # noqa: BLE001
         return "UNCHECKABLE", NO_TITLE + (f"{doi} is registered outside Crossref, but its "
                                           f"agency returned no readable metadata")
-    if isinstance(found, list):
-        found = found[0] if found else ""
-    found = str(found)
+    found = titles[0] if titles else ""
     if not claimed_title:
         return "OK", f"DOI resolves via a non-Crossref agency: {found[:60]}"
     if not found.strip():
         # The empty-title guard below was added to the Crossref path only, so a DataCite
         # record with no title still scored 0.00 and read MISMATCH. Audit 2026-09-28.
         return "UNCHECKABLE", NO_TITLE + f"{doi} resolves, but the registry record has no title"
-    r = title_match(claimed_title, found)
+    r, found = _best_title(claimed_title, titles)
     return (
         ("OK", f"DOI resolves (non-Crossref agency), title match {r:.2f}")
         if r >= 0.6
@@ -780,8 +852,7 @@ def _title_lookup(title):
         return None, NO_ORACLE + "Crossref returned non-JSON (error page?)"
     best, found = 0.0, ""
     for it in _j.get("message", {}).get("items", []):
-        cand = (it.get("title") or [""])[0]
-        r = title_match(title, cand)
+        r, cand = _best_title(title, _record_titles(it))
         if r > best:
             best, found = r, cand
     return best, found

@@ -44,7 +44,7 @@ class Registry:
     def __init__(self, crossref=None, search=(), doi_org=None, arxiv=None, arxiv_raw=None,
                  arxiv_search=(), landing=None, handle_raw=None):
         self.crossref = crossref or {}   # doi -> title, or a full Crossref `message` dict
-        self.search = list(search)       # titles a Crossref bibliographic query returns
+        self.search = list(search)       # titles (or full records) a Crossref query returns
         self.doi_org = doi_org or {}     # doi -> CSL-JSON, for DOIs outside Crossref
         # doi -> what content negotiation meets for a DOI that is registered but whose
         # agency has no metadata service: an HTTP code, or a 200 body (a landing page).
@@ -59,7 +59,7 @@ class Registry:
         self.calls.append(url)
         missing = urllib.error.HTTPError(url, 404, "Not Found", {}, None)
         if "api.crossref.org/works?" in url:
-            items = [{"title": [t]} for t in self.search]
+            items = [t if isinstance(t, dict) else {"title": [t]} for t in self.search]
             return json.dumps({"message": {"items": items}}), 200
         if "api.crossref.org/works/" in url:
             doi = urllib.parse.unquote(url.split("/works/")[1].split("?")[0])
@@ -882,6 +882,73 @@ check("an identifier-only pass says so", "[identifier only" in out and "passed o
       f"got {out}")
 rc, out = run_main({"r.bib": BIB}, reg=NATURE)
 check("...and a titled pass does not", "identifier" not in out, f"got {out}")
+
+# --- round 11: scoring a title the way it is actually written ---------------------------
+#
+# The 0.60 bar decides MISMATCH, but the 0.90 bar decides whether a real paper with a dead
+# DOI is rescued or FABRICATED, and whether a title-only reference clears. Ordinary
+# differences between a bibliography and a registry kept real titles below 0.90. None of
+# them could show up in the benchmark, which copies the registry's title verbatim. Found
+# by audit 2026-09-28.
+
+# 55. difflib's autojunk treats every character making up >1% of a 200+ character sequence
+#     as junk: for a long joined title, the space and most vowels. A one-word edit to a
+#     250-character title scored 0.54 on the string ratio.
+LONG = ("Efficacy and safety of a novel once-weekly subcutaneous formulation compared with daily "
+        "oral therapy in adults with moderate to severe chronic kidney disease and type 2 diabetes: "
+        "a randomised, double-blind, placebo-controlled, multicentre phase 3 trial")
+got = H.title_match(LONG.replace("novel", "new"), LONG)
+check("a one-word edit to a long title still certifies identity", got >= 0.90, f"got {got:.2f}")
+
+# 56. Registry markup against TeX. Crossref writes CO<sub>2</sub>, <i>α</i>, whole MathML
+#     trees and HTML entities; a bibliography writes CO$_2$ and $\alpha$.
+for cited, registry_title in [
+        ("Photocatalytic CO$_2$ reduction", "Photocatalytic CO<sub>2</sub> reduction"),
+        ("The $\\alpha$-helix revisited", "The <i>α</i>-helix revisited"),
+        ("E. coli growth kinetics", "<jats:italic>E. coli</jats:italic> growth kinetics"),
+        ("Fe$_3$O$_4$ nanoparticles", '<mml:math xmlns:mml="http://www.w3.org/1998/Math/MathML">'
+         "<mml:msub><mml:mi>Fe</mml:mi><mml:mn>3</mml:mn></mml:msub><mml:msub><mml:mi>O</mml:mi>"
+         "<mml:mn>4</mml:mn></mml:msub></mml:math> nanoparticles"),
+        ("Research \\& development", "Research &amp; development")]:
+    got = H.title_match(cited, registry_title)
+    check(f"TeX {cited[:22]!r} matches registry markup", got >= 0.90, f"got {got:.2f}")
+    # The score forgives one stray space ("co 2" vs "co2"); the tokens are the property.
+    check(f"...and folds to the same words", H.norm(cited) == H.norm(registry_title),
+          f"{H.norm(cited)} vs {H.norm(registry_title)}")
+
+# 57. TeX letters and grouping. {\o}, {\ss}, {\L} and the dotless \i of `\'{\i}` matched no
+#     accent pattern and shattered their words; braces became spaces, so the case
+#     protection in {BERT}ology split the word in two.
+for cited, plain in [(r"F\'{\i}sica cu\'{a}ntica", "Física cuántica"),
+                     (r"Bj{\o}rn's l{\ae}rebog", "Bjørn's lærebog"),
+                     (r"Stra{\ss}enbahn", "Straßenbahn"),
+                     (r"{\L}ukasiewicz logic", "Łukasiewicz logic"),
+                     (r"A Primer in {BERT}ology", "A Primer in BERTology"),
+                     (r"\emph{In vivo} imaging", "In vivo imaging")]:
+    got = H.title_match(cited, plain)
+    check(f"TeX {cited[:22]!r} matches its plain text", got >= 0.90, f"got {got:.2f}")
+    check(f"...and folds to the same words", H.norm(cited) == H.norm(plain),
+          f"{H.norm(cited)} vs {H.norm(plain)}")
+check("...and the fold still does not make everything match",
+      H.title_match(r"Bj{\o}rn's l{\ae}rebog", "Continuous Variable Quantum Cryptography") < 0.60)
+
+# 58. Crossref splits "Title: Subtitle" across two fields, and keeps an original-language
+#     title apart. Only title[0] was read, so a reference citing the full title scored 0.85
+#     against the bare one: below the rescue bar, so a real paper with a dead DOI read
+#     FABRICATED.
+REC = {"title": ["Deep Residual Learning for Image Recognition"], "subtitle": ["A Retrospective"]}
+FULL = "Deep Residual Learning for Image Recognition: A Retrospective"
+cls, why = verify(Registry(search=[REC]), doi="10.5555/dead.1", title=FULL)
+check("a dead DOI cited with the registry's subtitle is rescued", cls == "BAD-DOI", f"got {cls}: {why}")
+cls, why = verify(Registry(crossref={"10.1/sub": REC}), doi="10.1/sub", title=FULL)
+check("...and a live one matches in full", cls == "OK" and "1.00" in why, f"got {cls}: {why}")
+cls, why = verify(Registry(crossref={"10.1/orig": {"title": ["Quantum cryptography"],
+                                                   "original-title": ["Квантовая криптография"]}}),
+                  doi="10.1/orig", title="Квантовая криптография")
+check("a paper cited by its original-language title is OK", cls == "OK", f"got {cls}: {why}")
+cls, why = verify(Registry(search=[{"title": ["Bidirectional Encoders"], "short-title": ["BERT"]}]),
+                  doi="10.5555/dead.2", title="BERT")
+check("...but a short title cannot certify identity", cls == "FABRICATED", f"got {cls}: {why}")
 
 print(f"\n{'ALL PASS' if not FAILS else str(len(FAILS)) + ' FAILED: ' + ', '.join(FAILS)}")
 sys.exit(0 if not FAILS else 1)

@@ -141,6 +141,13 @@ content negotiation at doi.org, which answers by redirecting, sometimes to the p
 own page; a publisher's 404 on a moved page then read as an unregistered DOI, and a real one
 came back `FABRICATED`.
 
+**Typography is not a different title.** `CO$_2$` and `CO<sub>2</sub>`, `F\'{\i}sica` and
+`Física`, `{BERT}ology` and `BERTology` are compared as the same words: TeX accents, letters,
+math and braces, and the registry's HTML, JATS and MathML markup, are folded away first. A
+registry's subtitle and original-language title are compared too. These differences never
+decided `MISMATCH` at 0.60, but they kept real titles below the 0.90 bar that rescues a
+paper from a dead DOI, which is the difference between `BAD-DOI` and `FABRICATED`.
+
 **A guessed title is not evidence.** In a `\bibitem`, `\emph{}` holds the title in some
 styles and the journal or "et al." in others, and nothing in the entry says which. A title
 the parser had to guess can raise `SUSPECT`, never `MISMATCH`. Titles it can locate
