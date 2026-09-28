@@ -178,6 +178,7 @@ def run_suite(src):
     with tempfile.TemporaryDirectory() as d:
         (pathlib.Path(d) / "tests").mkdir()
         shutil.copy(ROOT / "tests" / "test_regressions.py", pathlib.Path(d) / "tests")
+        shutil.copytree(ROOT / "bench", pathlib.Path(d) / "bench")  # the suite builds its arms
         (pathlib.Path(d) / "hallucite.py").write_text(src)
         env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
         return subprocess.run([sys.executable, str(pathlib.Path(d) / "tests" / "test_regressions.py")],
