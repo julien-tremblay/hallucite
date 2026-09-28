@@ -62,7 +62,7 @@ you find out about from a reviewer.
 | `BAD-DOI` | The paper is real; the identifier resolves nowhere | warn |
 | `SUSPECT` | Title-only reference with no close Crossref match, or an identifier that resolves to a title disagreeing with one the parser could only guess | warn |
 | `UNCHECKABLE` | No DOI, arXiv id, or usable title | warn |
-| `UNCHECKABLE` | A registry could not be reached | **hard fail** under `--gate` |
+| `UNCHECKABLE` | A registry could not be reached, or a request could not be sent safely | **hard fail** under `--gate` |
 | `OK` | Resolved and the title matches | pass |
 
 ## How often does it accuse you wrongly
@@ -129,9 +129,17 @@ field, an `arXiv:` prefix, an arxiv.org URL or an arXiv DOI, never from whatever
 text an entry contains. Scanning the whole entry turned an IEEE Xplore URL into the arXiv id
 `document/8765432`, and a real paper into `FABRICATED`.
 
-**A registry's own gaps are not accusations.** A Crossref record with an empty title, or a
-DOI that resolves without readable metadata, reports `UNCHECKABLE` and says why. Comparing a
-cited title against an empty one scores 0.00, which used to read as `MISMATCH`.
+**A registry's own gaps are not accusations.** A Crossref or DataCite record with an empty
+title, or a registered DOI whose agency offers no readable metadata, reports `UNCHECKABLE`
+and says why. Comparing a cited title against an empty one scores 0.00, which used to read
+as `MISMATCH`. These gaps are permanent, so they do not fail `--gate`: a gate that fails on
+every run for a reason nobody can fix gets switched off.
+
+**Whether a DOI exists is asked of the DOI system.** For a DOI Crossref does not hold, the
+DOI system's Handle API says whether it is registered at all. This used to be inferred from
+content negotiation at doi.org, which answers by redirecting, sometimes to the publisher's
+own page; a publisher's 404 on a moved page then read as an unregistered DOI, and a real one
+came back `FABRICATED`.
 
 **A guessed title is not evidence.** In a `\bibitem`, `\emph{}` holds the title in some
 styles and the journal or "et al." in others, and nothing in the entry says which. A title

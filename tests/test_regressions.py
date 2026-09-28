@@ -42,10 +42,14 @@ class Registry:
     branch -- the point of the tool -- went without a single offline test."""
 
     def __init__(self, crossref=None, search=(), doi_org=None, arxiv=None, arxiv_raw=None,
-                 arxiv_search=()):
+                 arxiv_search=(), landing=None, handle_raw=None):
         self.crossref = crossref or {}   # doi -> title, or a full Crossref `message` dict
         self.search = list(search)       # titles a Crossref bibliographic query returns
         self.doi_org = doi_org or {}     # doi -> CSL-JSON, for DOIs outside Crossref
+        # doi -> what content negotiation meets for a DOI that is registered but whose
+        # agency has no metadata service: an HTTP code, or a 200 body (a landing page).
+        self.landing = landing or {}
+        self.handle_raw = handle_raw     # (status, body) from the Handle API, to simulate faults
         self.arxiv = arxiv or {}         # id -> title
         self.arxiv_raw = arxiv_raw       # a raw arXiv response body, to simulate outages
         self.arxiv_search = list(arxiv_search)  # titles an arXiv title search returns
@@ -63,8 +67,23 @@ class Registry:
             if rec is None:
                 raise missing
             return json.dumps({"message": {"title": [rec]} if isinstance(rec, str) else rec}), 200
+        if url.startswith("https://doi.org/api/handles/"):
+            if self.handle_raw:
+                st, body = self.handle_raw
+                if st != 200:
+                    raise urllib.error.HTTPError(url, st, "x", {}, None)
+                return body, 200
+            doi = urllib.parse.unquote(url[len("https://doi.org/api/handles/"):])
+            if doi in self.doi_org or doi in self.landing:
+                return json.dumps({"responseCode": 1, "handle": doi}), 200
+            raise missing  # the Handle API answers 404 with responseCode 100
         if url.startswith("https://doi.org/"):
             doi = urllib.parse.unquote(url[len("https://doi.org/"):])
+            if doi in self.landing:
+                page = self.landing[doi]
+                if isinstance(page, int):
+                    raise urllib.error.HTTPError(url, page, "x", {}, None)
+                return page, 200
             if doi not in self.doi_org:
                 raise missing
             return json.dumps(self.doi_org[doi]), 200
@@ -735,6 +754,53 @@ check("a dead arXiv id whose title is real is BAD-DOI", cls == "BAD-DOI", f"got 
 cls, why = verify(Registry(arxiv_raw="<html>down</html>"), doi="10.5555/1234567.7654321", title=BERT)
 check("a rescue with one source down and no match is half a check",
       cls == "UNCHECKABLE" and H.NO_ORACLE in why, f"got {cls}: {why}")
+
+# --- round 8: whether a DOI exists is asked of the DOI system, not of a redirect ------
+
+# 45. doi.org answers content negotiation by REDIRECTING, and for an agency with no
+#     metadata service the redirect lands on the publisher's page. urllib follows it, so a
+#     publisher's 404 on a moved page read as "does not resolve at doi.org (all
+#     registration agencies)": a REGISTERED DOI came back FABRICATED. Existence now comes
+#     from the Handle API. What the landing page does is a metadata gap, soft, permanent.
+for label, page in [("a publisher 404 on the landing page", 404),
+                    ("a publisher bot wall", 403),
+                    ("an agency with no metadata service", "<html>Landing page</html>")]:
+    reg = Registry(landing={"10.1234/x": page})
+    cls, why = verify(reg, doi="10.1234/x", title="A Real Report")
+    check(f"registered DOI, {label}: not FABRICATED, not a gate failure",
+          cls == "UNCHECKABLE" and why.startswith(H.NO_TITLE), f"got {cls}: {why}")
+rc, out = run_main({"r.bib": "@techreport{r, title={A Real Report}, doi={10.1234/x}}\n"}, "--gate",
+                   reg=Registry(landing={"10.1234/x": 404}))
+check("...and --gate passes on it rather than failing forever", rc == 0, f"got exit {rc}: {out}")
+
+# 46. The Handle API's own answers. 404 (and responseCode 100 on a 200) is "not registered";
+#     anything unreadable is an outage, never an accusation.
+cls, why = verify(Registry(), doi="10.9999/nope", title="Quantum Wombat Onomastics")
+check("an unregistered DOI with an unknown title is FABRICATED", cls == "FABRICATED", f"got {cls}: {why}")
+cls, why = verify(Registry(handle_raw=(200, '{"responseCode": 100}')), doi="10.9999/nope",
+                  title="Quantum Wombat Onomastics")
+check("responseCode 100 is 'not registered'", cls == "FABRICATED", f"got {cls}: {why}")
+for label, raw in [("a 503", (503, "")), ("a 200 that is not JSON", (200, "<html>maintenance</html>")),
+                   ("an unexpected responseCode", (200, '{"responseCode": 2}'))]:
+    cls, why = verify(Registry(handle_raw=raw), doi="10.9999/nope", title="Quantum Wombat Onomastics")
+    check(f"Handle API {label} is an outage", cls == "UNCHECKABLE" and H.NO_ORACLE in why,
+          f"got {cls}: {why}")
+
+# 47. The empty-title guard reached the Crossref path only. A DataCite record with no title
+#     scored 0.00 against the cited one and read MISMATCH.
+for empty in ["", []]:
+    cls, why = verify(Registry(doi_org={"10.5281/zenodo.2": {"title": empty}}),
+                      doi="10.5281/zenodo.2", title="My dataset v1.2")
+    check(f"an empty non-Crossref title ({empty!r}) is UNCHECKABLE, not MISMATCH",
+          cls == "UNCHECKABLE" and why.startswith(H.NO_TITLE), f"got {cls}: {why}")
+
+# 48. A `..` path segment is resolved by the server before the lookup, so a crafted DOI
+#     could be answered with the record of a different, real DOI. It is not sent at all.
+reg = Registry(crossref={"10.1038/nature14539": "Deep learning"})
+cls, why = verify(reg, doi="10.1234/../../works/10.1038/nature14539", title="Deep learning")
+check("a DOI with a '..' segment is not sent", cls == "UNCHECKABLE" and not reg.calls,
+      f"got {cls}: {why}; calls {reg.calls}")
+check("...and it fails the gate like any check that did not run", H.NO_ORACLE in why, why)
 
 print(f"\n{'ALL PASS' if not FAILS else str(len(FAILS)) + ' FAILED: ' + ', '.join(FAILS)}")
 sys.exit(0 if not FAILS else 1)

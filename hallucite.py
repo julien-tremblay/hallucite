@@ -50,7 +50,8 @@ MAILTO = os.environ.get("CROSSREF_MAILTO", "").strip()
 UA = "hallucite/1.0 (+https://github.com/julien-tremblay/hallucite)" + (
     f" mailto:{MAILTO}" if MAILTO else "")
 TIMEOUT = 12
-# Prefix on every "the oracle could not answer" message. verify() used to detect these by
+# Prefix on every "the check did not run" message: the oracle could not answer, or the
+# request could not be sent safely. verify() used to detect these by
 # looking for the substrings "error"/"HTTP" in a human-readable sentence, which failed twice
 # over: a non-JSON response said neither, so a fabricated DOI fell through to fuzzy title
 # matching and came back OK; and the French "erreur" does not contain "error". A sentinel is
@@ -560,7 +561,16 @@ def parse_inline(text):
 
 
 # ---- verification ----------------------------------------------------------
+# A `.` or `..` path segment is resolved by the server before the lookup, so the DOI
+# `10.1234/../../works/10.1038/nature14539` would be answered with the record of a different,
+# real DOI. No registered DOI needs one. Audit 2026-09-28; not tried against the live API.
+_DOT_SEGMENT = re.compile(r"(?:^|/)\.{1,2}(?:/|$)")
+
+
 def check_doi(doi, claimed_title):
+    if _DOT_SEGMENT.search(doi):
+        return "UNCHECKABLE", NO_ORACLE + (f"not sent: {doi} contains a '.' or '..' path "
+                                           f"segment, which would be looked up as another DOI")
     try:
         body, status = _get(
             f"https://api.crossref.org/works/{urllib.parse.quote(doi)}?mailto={MAILTO}"
@@ -568,45 +578,7 @@ def check_doi(doi, claimed_title):
     except urllib.error.HTTPError as e:
         if e.code != 404:
             return "UNCHECKABLE", NO_ORACLE + f"Crossref HTTP {e.code}"
-        # ABSENCE FROM ONE REGISTRY IS NOT ABSENCE. Crossref only knows DOIs registered with Crossref. DataCite DOIs 404 there
-        # while being perfectly valid: that covers most institutional repositories and
-        # every arXiv DOI (10.48550/*). Verified live 2026-08-13: 10.48550/arXiv.2512.24601,
-        # a real arXiv DOI, was reported FABRICATED for a week, and rightly
-        # so. Content negotiation at doi.org covers ALL registration agencies.
-        try:
-            _b, _st = _get(
-                f"https://doi.org/{urllib.parse.quote(doi)}",
-                accept="application/vnd.citationstyles.csl+json",
-            )
-        except urllib.error.HTTPError as e2:
-            if e2.code == 404:
-                return _unresolvable(
-                    f"DOI {doi} does not resolve at doi.org (all registration agencies)",
-                    f"DOI {doi}", claimed_title)
-            return "UNCHECKABLE", NO_ORACLE + f"doi.org HTTP {e2.code}"
-        except Exception as e2:  # noqa: BLE001
-            return "UNCHECKABLE", NO_ORACLE + f"doi.org {type(e2).__name__}"
-        try:
-            _csl = json.loads(_b)
-        except ValueError:
-            # It resolves, so it is not fabricated -- but with no readable metadata the
-            # title cannot be compared, and a MISMATCH is exactly what would hide here.
-            # Reporting OK claimed a check that never ran.
-            return "UNCHECKABLE", NO_ORACLE + f"{doi} resolves but returned no metadata"
-        found = _csl.get("title") or ""
-        if isinstance(found, list):
-            found = found[0] if found else ""
-        if not claimed_title:
-            return "OK", f"DOI resolves via a non-Crossref agency: {found[:60]}"
-        r = title_match(claimed_title, found)
-        return (
-            ("OK", f"DOI resolves (non-Crossref agency), title match {r:.2f}")
-            if r >= 0.6
-            else (
-                "MISMATCH",
-                f"DOI resolves to a DIFFERENT title (match {r:.2f}): '{found[:60]}'",
-            )
-        )
+        return _check_doi_elsewhere(doi, claimed_title)
     except Exception as e:  # noqa: BLE001
         return "UNCHECKABLE", NO_ORACLE + f"Crossref {type(e).__name__}"
     try:
@@ -631,6 +603,72 @@ def check_doi(doi, claimed_title):
         else (
             "MISMATCH",
             f"DOI resolves to a DIFFERENT title (match {r:.2f}): got '{found[:60]}'",
+        )
+    )
+
+
+def _check_doi_elsewhere(doi, claimed_title):
+    """A DOI Crossref does not hold.
+
+    ABSENCE FROM ONE REGISTRY IS NOT ABSENCE. Crossref only knows DOIs registered with
+    Crossref. DataCite DOIs 404 there while being perfectly valid: that covers most
+    institutional repositories and every arXiv DOI (10.48550/*). Verified live 2026-08-13:
+    10.48550/arXiv.2512.24601, a real arXiv DOI, was reported FABRICATED for a week.
+
+    Whether the DOI EXISTS is asked of the DOI system itself, through its Handle API, which
+    answers from the registry and redirects nowhere. It used to be inferred from content
+    negotiation at doi.org, which answers by REDIRECTING -- to the agency's metadata service
+    when there is one, to the publisher's landing page when there is not -- and urllib
+    follows redirects. A publisher's 404 on a moved landing page therefore read as "does
+    not resolve at doi.org (all registration agencies)", and a registered DOI came back
+    FABRICATED. Reproduced with real urllib against a local server, audit 2026-09-28.
+    """
+    try:
+        hbody, _ = _get(f"https://doi.org/api/handles/{urllib.parse.quote(doi)}")
+        code = json.loads(hbody).get("responseCode")
+    except urllib.error.HTTPError as e:
+        code = 100 if e.code == 404 else None
+        if code is None:
+            return "UNCHECKABLE", NO_ORACLE + f"doi.org handle API HTTP {e.code}"
+    except (ValueError, AttributeError):
+        return "UNCHECKABLE", NO_ORACLE + "doi.org handle API returned something that is not JSON"
+    except Exception as e:  # noqa: BLE001
+        return "UNCHECKABLE", NO_ORACLE + f"doi.org {type(e).__name__}"
+    if code == 100:  # the Handle System's "handle not found"
+        return _unresolvable(f"DOI {doi} is not registered with any agency (doi.org)",
+                             f"DOI {doi}", claimed_title)
+    if code not in (1, 200):  # 1: found; 200: found, but it carries no values
+        return "UNCHECKABLE", NO_ORACLE + f"doi.org handle API responseCode {code}"
+
+    # The DOI is registered. What remains is whether its title matches, which needs the
+    # agency's metadata. An agency without content negotiation lands on a publisher page,
+    # and a publisher may refuse bots. Both are permanent gaps on their side, not outages:
+    # they were NO_ORACLE, which failed --gate on every run with "re-run when the registry
+    # answers", forever. The DOI system has just answered, so this is not an outage.
+    try:
+        b, _ = _get(f"https://doi.org/{urllib.parse.quote(doi)}",
+                    accept="application/vnd.citationstyles.csl+json")
+        csl = json.loads(b)
+        found = csl.get("title") or ""
+    except Exception:  # noqa: BLE001
+        return "UNCHECKABLE", NO_TITLE + (f"{doi} is registered outside Crossref, but its "
+                                          f"agency returned no readable metadata")
+    if isinstance(found, list):
+        found = found[0] if found else ""
+    found = str(found)
+    if not claimed_title:
+        return "OK", f"DOI resolves via a non-Crossref agency: {found[:60]}"
+    if not found.strip():
+        # The empty-title guard below was added to the Crossref path only, so a DataCite
+        # record with no title still scored 0.00 and read MISMATCH. Audit 2026-09-28.
+        return "UNCHECKABLE", NO_TITLE + f"{doi} resolves, but the registry record has no title"
+    r = title_match(claimed_title, found)
+    return (
+        ("OK", f"DOI resolves (non-Crossref agency), title match {r:.2f}")
+        if r >= 0.6
+        else (
+            "MISMATCH",
+            f"DOI resolves to a DIFFERENT title (match {r:.2f}): '{found[:60]}'",
         )
     )
 
@@ -997,6 +1035,18 @@ def selftest():
             },
             "BAD-DOI",
         ),
+        # A DataCite DOI: Crossref 404s it, so this is the one live case that exercises the
+        # Handle API and doi.org content negotiation. Neither could be reached when that path
+        # was rewritten (audit 2026-09-28), so a failure here is the first place to look.
+        (
+            {
+                "doi": "10.48550/arXiv.1706.03762",
+                "arxiv": "",
+                "title": "Attention Is All You Need",
+                "key": "t7",
+            },
+            "OK",
+        ),
     ]
     # A case whose registry could not be REACHED is SKIPPED, not failed. The distinction is
     # the whole point: "the tool gave the wrong answer" and "the oracle was rate-limited" are
@@ -1114,11 +1164,11 @@ def main():
             time.sleep(0.25)  # be polite to Crossref/arXiv
     print(
         f"\nsummary: {hard} hard (fabricated/mismatch), {soft} soft (suspect/uncheckable)"
-        + (f", {degraded} UNVERIFIED (registry unreachable)" if degraded else "")
+        + (f", {degraded} UNVERIFIED (the check could not run)" if degraded else "")
     )
     if degraded:
         print(
-            f"WARNING: {degraded} reference(s) could not be checked against any registry.\n"
+            f"WARNING: {degraded} reference(s) could not be checked; the reason is on each line.\n"
             "         This run does not clear them. Re-run when the registry answers."
         )
     if gate:
