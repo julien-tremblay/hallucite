@@ -1032,5 +1032,44 @@ finally:
 check("the polite-pool address is URL-encoded", reg.calls and "mailto=me%2Bhallucite%40example.org" in reg.calls[0],
       f"got {reg.calls}")
 
+# --- round 13: the benchmark's own machinery, offline ---------------------------------
+#
+# 64. bench/ only measures anything against live Crossref, so nothing ran it and nothing would
+#     notice it rotting. build.py itself is offline: build every arm from a small synthetic
+#     manifest -- registry markup, a separate subtitle, TeX letters -- and hold the verifier to
+#     what each arm promises. The deformed, rescue and .bbl arms were added 2026-09-28 because
+#     the original three could not produce any of the false accusations the audit found.
+WORKS = [
+    {"doi": "10.1021/jacs.0c01234", "subtitle": "a mechanistic study", "venue": "J. Am. Chem. Soc.",
+     "title": "Photocatalytic CO<sub>2</sub> reduction on Fe<sub>3</sub>O<sub>4</sub>", "year": 2020},
+    {"doi": "10.1016/j.cell.2019.01.001", "subtitle": "", "venue": "Cell",
+     "title": "<i>In vivo</i> imaging of the <i>α</i>-helix", "year": 2019},
+    {"doi": "10.1007/978-3-030-12345-6_7", "subtitle": "Łukasiewicz revisited", "venue": "LNCS",
+     "title": "Física cuántica y Straße: Bjørn's lærebog", "year": 2021},
+    {"doi": "10.1103/physrevlett.88.057902", "subtitle": "", "venue": "Phys. Rev. Lett.",
+     "title": "Continuous Variable Quantum Cryptography Using Coherent States", "year": 2002},
+]
+RECORDS = {w["doi"]: {"title": [w["title"]], **({"subtitle": [w["subtitle"]]} if w["subtitle"] else {})}
+           for w in WORKS}
+BENCH_REG = Registry(crossref=RECORDS, search=list(RECORDS.values()))
+with tempfile.TemporaryDirectory() as d:
+    man = pathlib.Path(d, "manifest.json")
+    man.write_text(json.dumps([dict(w, type="journal-article", original_title="") for w in WORKS]))
+    built = subprocess.run([sys.executable, str(pathlib.Path(HAL).parent / "bench" / "build.py"), str(man), d],
+                           capture_output=True, text=True)
+    check("bench/build.py builds every arm", built.returncode == 0, built.stderr[-300:])
+    arms = {n: pathlib.Path(d, n).read_text() for n in
+            ("raw.bib", "perturbed.bib", "deformed.bib", "rescue.bib", "control.bib", "raw.bbl")
+            if pathlib.Path(d, n).exists()}
+for name in ("raw.bib", "perturbed.bib", "deformed.bib", "raw.bbl"):
+    rc, out = run_main({name: arms.get(name, "")}, "--gate", reg=BENCH_REG)
+    check(f"bench arm {name}: real works, no hard finding", rc == 0 and "[ ok ]" in out,
+          f"got exit {rc}: {out}")
+rc, out = run_main({"rescue.bib": arms.get("rescue.bib", "")}, reg=BENCH_REG)
+check("bench arm rescue.bib: every deformed real title is rescued",
+      out.count("[BDOI]") == len(WORKS), f"got: {out}")
+rc, out = run_main({"control.bib": arms.get("control.bib", "")}, "--gate", reg=BENCH_REG)
+check("bench arm control.bib: the run can fail", rc == 1 and "[FABR]" in out, f"got exit {rc}")
+
 print(f"\n{'ALL PASS' if not FAILS else str(len(FAILS)) + ' FAILED: ' + ', '.join(FAILS)}")
 sys.exit(0 if not FAILS else 1)

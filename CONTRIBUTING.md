@@ -32,13 +32,14 @@ The false-positive measurement, about ten minutes and no API key:
 ```
 python3 bench/sample.py manifest.json
 python3 bench/build.py manifest.json .
-python3 hallucite.py raw.bib
-python3 hallucite.py perturbed.bib
+python3 hallucite.py raw.bib perturbed.bib deformed.bib raw.bbl   # want zero hard findings
+python3 hallucite.py rescue.bib       # want BAD-DOI on every line
 python3 hallucite.py control.bib      # must produce hard findings, or the run is vacuous
 ```
 
-If your sample gives a non-zero false-positive rate where the README claims zero, that is a
-finding and I want to see it. Include `manifest.json` so it can be reproduced.
+If your sample gives a non-zero false-positive rate, that is a finding and I want to see it.
+Include `manifest.json` so it can be reproduced. A run of the current tool has not been
+published yet, so a clean one is worth sending too.
 
 ## If you send a patch
 
