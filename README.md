@@ -59,7 +59,7 @@ you find out about from a reviewer.
 | `FABRICATED` | Identifier resolves nowhere **and** no record matches the title | hard fail |
 | `MISMATCH` | Resolves, but to a **different title** | hard fail |
 | `BAD-DOI` | The paper is real; the identifier resolves nowhere | warn |
-| `SUSPECT` | Title-only reference with no close Crossref match | warn |
+| `SUSPECT` | Title-only reference with no close Crossref match, or an identifier that resolves to a title disagreeing with one the parser could only guess | warn |
 | `UNCHECKABLE` | No DOI, arXiv id, or usable title | warn |
 | `UNCHECKABLE` | A registry could not be reached | **hard fail** under `--gate` |
 | `OK` | Resolved and the title matches | pass |
@@ -124,6 +124,13 @@ simply carries no identifier is a different thing, and stays soft.
 DOI that resolves without readable metadata, reports `UNCHECKABLE` and says why. Comparing a
 cited title against an empty one scores 0.00, which used to read as `MISMATCH`.
 
+**A guessed title is not evidence.** In a `\bibitem`, `\emph{}` holds the title in some
+styles and the journal or "et al." in others, and nothing in the entry says which. A title
+the parser had to guess can raise `SUSPECT`, never `MISMATCH`. Titles it can locate
+unambiguously (a `title` field, ``` ``quoted'' ```, `\bibinfo{title}`, the first `\newblock`
+of a `.bbl`) still can. Before this, the `.bbl` BibTeX writes for natbib users had its
+`\emph{}` venue read as the title, and every reference carrying a DOI came back `MISMATCH`.
+
 **A parser failure is not a clean bill of health.** If a file plainly contains citations and
 zero are parsed, that is reported as a hard failure rather than "0 fabricated." Silent
 degradation into a reassuring green is the specific failure this tool exists to prevent.
@@ -137,9 +144,11 @@ program, so there is nothing to hallucinate.
 
 - Books, theses, standards, and non-indexed venues often have no DOI and land in `SUSPECT`
   or `UNCHECKABLE`. That is a prompt to look, not a verdict.
-- **Titles shorter than two characters, and `\bibitem` entries whose title is neither
-  quoted nor emphasised, parse without a title.** The DOI is still checked; the
-  title comparison simply does not run, and the reference reads `OK` on resolution alone.
+- **Titles shorter than two characters, and `\bibitem` entries whose title is not quoted,
+  tagged with `\bibinfo{title}`, set off by `\newblock` or emphasised, parse without a
+  title.** The DOI is still checked; the title comparison simply does not run, and the
+  reference reads `OK` on resolution alone. An emphasised title is a guess and can only
+  ever produce `SUSPECT`.
 - **It catches invented and swapped references, not subtly altered ones.** Title comparison
   is lexical, so "Attention Is Not All You Need" scores 0.93 against "Attention Is All You
   Need" and passes, as does Recognition -> Segmentation. Authors, venue and year are parsed
@@ -165,8 +174,10 @@ with a concrete case, that is a bug report I can act on.
 3. **Tell me the thresholds are wrong.** A title scores 0..1; 0.60 separates `OK` from
    `MISMATCH` and 0.90 is the bar for saying two titles are the same work. Both were chosen
    to satisfy cases I had, not derived from anything.
-4. **Break the parsers.** `.bbl`, RIS, Zotero and Mendeley exports, biblatex `@online`,
-   `crossref`-inherited fields, and `@string` macros are all untested. A file that plainly
+4. **Break the parsers.** RIS, Zotero and Mendeley exports, biblatex `@online` and
+   `crossref`-inherited fields are untested. `.bbl` files from the standard BibTeX styles,
+   ACM's and REVTeX's `\bibinfo` form, `@string` macros and `@article(...)` entries have
+   fixtures now, but only hand-built ones. A file that plainly
    contains references and yields zero is reported as a parser failure, but a file that
    yields *some* is not, and silent partial loss is the defect this tool exists to prevent.
 5. **Argue with `BAD-DOI`.** Splitting "this identifier is dead" from "this paper does not

@@ -12,6 +12,7 @@ Classes (most→least dangerous):
   MISMATCH    DOI/arXiv resolves, but to a DIFFERENT title          -> hard
   BAD-DOI     the paper is real, the identifier resolves nowhere    -> soft
   SUSPECT     title-only ref with no close Crossref match           -> soft (may be a book/thesis/non-indexed venue)
+              or a resolving id disagreeing with a GUESSED title   -> soft (a guess is not evidence)
   OK          resolved and title matches                            -> pass
   UNCHECKABLE no DOI / arXiv / usable title, or registry unreachable-> soft; unreachable also fails --gate
 
@@ -200,7 +201,7 @@ def title_match(a, b):
 
 # ---- reference extraction --------------------------------------------------
 def _entries(text):
-    """Yield (etype, key, body) for each @entry, counting braces.
+    """Yield (etype, inner text) for each @entry, counting braces.
 
     The old regex required the closing brace to start a line. An indented `  }`, a `}}`
     riding on the last field's line, and a one-line entry were all INVISIBLE, and an
@@ -209,25 +210,115 @@ def _entries(text):
     an indented closing brace passed --gate with exit 0. Silent partial loss is the exact
     failure this tool exists to prevent, so the scanner must not depend on layout.
     """
-    for m in re.finditer(r"@(\w+)\s*\{", text):
+    # `@article(key, ...)` is legal BibTeX and was silently skipped, so a mixed file lost
+    # those entries without a word. With `(` delimiters a `)` closes the entry only at brace
+    # depth zero and outside a quoted value. Scanning resumes AFTER each entry, so an `@`
+    # inside a field value cannot open a phantom entry.
+    pos = 0
+    for m in re.finditer(r"@(\w+)\s*([{(])", text):
+        if m.start() < pos:
+            continue
         i = m.end()
-        depth, j = 1, i
-        while j < len(text) and depth:
-            if text[j] == "{":
+        closer = "}" if m.group(2) == "{" else ")"
+        depth, j, quoted = 0, i, False
+        while j < len(text):
+            c = text[j]
+            if c == "{":
                 depth += 1
-            elif text[j] == "}":
+            elif c == "}":
+                if depth == 0 and closer == "}":
+                    break
                 depth -= 1
+            elif closer == ")" and depth == 0:
+                if c == '"':
+                    quoted = not quoted
+                elif c == ")" and not quoted:
+                    break
             j += 1
-        if depth:
+        if j >= len(text):
             continue  # unterminated entry: truncated file
-        key, _, body = text[i : j - 1].partition(",")
-        yield m.group(1).lower(), key.strip(), body
+        pos = j + 1
+        yield m.group(1).lower(), text[i:j]
+
+
+# Month abbreviations are predefined macros in every BibTeX style.
+_MONTHS = {m: m for m in ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep",
+                          "oct", "nov", "dec")}
+
+
+def _bib_value(body, i, macros, raw_words=False):
+    """Parse the BibTeX value starting at body[i]: `{...}`, `"..."`, a number, or an
+    @string macro, joined by `#`.
+
+    Returns None when the value uses a macro that is not defined, which is different from
+    empty: the old parser returned the bare word, so `title = t1` was compared against the
+    registry as the title "t1" and the reference came back MISMATCH. `raw_words` keeps an
+    undefined bare word verbatim, for fields like `doi` that people write unbraced.
+
+    Inside `"..."` a `"` at brace depth > 0 does not end the value. The old parser stopped
+    at the first `"`, so `title = "{\\"U}ber ..."` -- the form BibTeX itself requires for
+    an umlaut in a quoted field -- parsed as `{\\`, scored 0.00, and read MISMATCH.
+    """
+    parts = []
+    while True:
+        while i < len(body) and body[i].isspace():
+            i += 1
+        if i >= len(body):
+            break
+        if body[i] in '{"':
+            close = "}" if body[i] == "{" else '"'
+            depth, j = 0, i + 1
+            while j < len(body):
+                c = body[j]
+                if c == "{":
+                    depth += 1
+                elif c == "}":
+                    if depth == 0 and close == "}":
+                        break
+                    depth -= 1
+                elif c == '"' and close == '"' and depth == 0:
+                    break
+                j += 1
+            parts.append(body[i + 1 : j])
+            i = j + 1
+        else:
+            m = re.match(r"[^\s,#{}\"]+", body[i:])
+            if not m:
+                break
+            word = m.group(0)
+            i += len(word)
+            if word.isdigit():
+                parts.append(word)
+            elif word.lower() in macros:
+                parts.append(macros[word.lower()])
+            elif raw_words:
+                parts.append(word)
+            else:
+                return None
+        while i < len(body) and body[i].isspace():
+            i += 1
+        if i < len(body) and body[i] == "#":
+            i += 1
+            continue
+        break
+    return re.sub(r"\s+", " ", "".join(parts)).strip()
 
 
 def parse_bib(text):
     """Yield dicts for each @entry with the fields we can verify."""
     refs = []
-    for etype, key, body in _entries(text):
+    macros = dict(_MONTHS)
+    for etype, inner in _entries(text):
+        if etype == "string":
+            # @string{name = value}. Defined in file order, and a value may use an earlier one.
+            sm = re.match(r"\s*([^\s=]+)\s*=\s*", inner)
+            if sm:
+                val = _bib_value(inner, sm.end(), macros)
+                if val is not None:
+                    macros[sm.group(1).lower()] = val
+            continue
+        key, _, body = inner.partition(",")
+        key = key.strip()
         # The old bibtex entry regex stopped before the final newline while field()
         # required a trailing one, so the LAST field of every entry was invisible.
         # Worst case: when title came last it parsed as empty, check_doi took the
@@ -235,12 +326,12 @@ def parse_bib(text):
         # silently disabled MISMATCH detection, which is the entire point of the tool.
         # `control` is REVTeX's bookkeeping entry (@CONTROL{REVTEX42Control}); it carries
         # no reference. It only became visible once the scanner stopped needing a newline.
-        if etype in ("comment", "string", "preamble", "control") or not body.strip():
+        if etype in ("comment", "preamble", "control") or not body.strip():
             continue
         body += "\n"
 
-        def field(name):
-            """One field's value, counting braces.
+        def field(name, raw_words=False):
+            """One field's value, counting braces, or "" if absent or unresolvable.
 
             The earlier `[{"](.+?)[}"]` was blind to nesting. BibTeX case
             protection is universal in physics (`title = {{Bell} inequalities
@@ -256,21 +347,9 @@ def parse_bib(text):
             fm = re.search(r"(?:^|[,{\s])" + name + r"\s*=\s*", body, re.I)
             if not fm:
                 return ""
-            i = fm.end()
-            if i < len(body) and body[i] in '{"':
-                opener = body[i]
-                close = "}" if opener == "{" else '"'
-                depth, j = 1, i + 1
-                while j < len(body) and depth:
-                    if opener == "{" and body[j] == "{":
-                        depth += 1
-                    elif body[j] == close:
-                        depth -= 1
-                    j += 1
-                return re.sub(r"\s+", " ", body[i + 1 : j - 1]).strip()
-            return body[i:].split(",")[0].strip()
+            return _bib_value(body, fm.end(), macros, raw_words) or ""
 
-        doi = clean_doi(field("doi"))
+        doi = clean_doi(field("doi", raw_words=True))
         if not doi:
             # @misc entries routinely park the DOI in `note` or `howpublished` rather than
             # a `doi` field. The arXiv branch below already falls back to scanning the
@@ -279,7 +358,7 @@ def parse_bib(text):
             dm = re.search(DOI_RE, body)
             if dm:
                 doi = clean_doi(dm.group(0))
-        eprint = field("eprint")
+        eprint = field("eprint", raw_words=True)
         # arXiv id: new-style (2101.01234) OR old-style (quant-ph/0101012, math.AG/0512013)
         arxiv = ""
         am = re.search(ARXIV_RE, eprint)
@@ -294,10 +373,92 @@ def parse_bib(text):
                 "doi": doi.lower().replace("https://doi.org/", ""),
                 "arxiv": arxiv,
                 "title": field("title"),
-                "year": field("year"),
+                "title_guess": False,
+                "year": field("year", raw_words=True),
             }
         )
     return refs
+
+
+def _braced(s, i):
+    """Content of the group whose `{` sits just before s[i], or None if unterminated."""
+    depth, j = 1, i
+    while j < len(s) and depth:
+        if s[j] == "{":
+            depth += 1
+        elif s[j] == "}":
+            depth -= 1
+        j += 1
+    return None if depth else s[i : j - 1]
+
+
+# Bibliographies use these where a title would sit; none of them is one.
+_NOT_A_TITLE = re.compile(r"(?:et\s+al\.?|ibid\.?|op\.\s*cit\.?|eds?\.?|[\W\d_]+)", re.I)
+_FONT = re.compile(r"\\(?:emph|textit|textsl|textbf|textsc|textrm|mbox|enquote)\s*\{|"
+                   r"\{\\(?:em|it|sl|bf|sc|rm)\b\s*")
+
+
+def _tidy_title(raw):
+    """Collapse whitespace and drop font wrappers (their braces are harmless to norm())."""
+    t = re.sub(r"\s+", " ", _FONT.sub("{", raw)).strip()
+    t = t.rstrip(".,").strip()
+    if t.startswith("{") and _braced(t, 1) == t[1:-1]:
+        t = t[1:-1].strip()
+    return "" if _NOT_A_TITLE.fullmatch(t) else t
+
+
+def _bibitem_title(body):
+    r"""The title of a \bibitem when the entry says unambiguously where it is, else None.
+
+    Ranked by how unambiguous the source is. A title from any of these may produce
+    MISMATCH; one from _bibitem_emph_guess may not.
+
+    1. ``...'' or "..." -- IEEE-style bibliographies quote the title. The LaTeX quote form
+       comes FIRST: one corpus uses \emph{} for "et al." and for journal names, so an
+       emph-first heuristic captured "et al." as the title and reported four correct
+       references as MISMATCH (match 0.14) on 2026-08-25. An explicit quote IS the title,
+       however short, so the floor is 2; at 6 it silently dropped ``Chaos'' and ``Two''.
+       A `"` preceded by a backslash is an umlaut, not a quotation mark: `Schr\"odinger
+       and G\"odel` used to parse as the title `odinger and G\` and read MISMATCH.
+    2. \bibinfo{title}{...} -- what ACM's and REVTeX's .bbl files write.
+    3. The first \newblock segment -- what every standard BibTeX style (plain, plainnat,
+       abbrv, unsrt, alpha, apalike) writes: authors, \newblock title, \newblock venue.
+       Before this, a plainnat .bbl had its \emph{} VENUE read as the title, so every
+       reference carrying a DOI came back MISMATCH against "Nature" or "Proceedings of
+       the IEEE Conference on ...". Found by audit 2026-09-28.
+    """
+    m = re.search(r"``(.{2,300}?)''", body, re.S)
+    if not m:
+        m = re.search(r'(?<!\\)"(.{2,300}?)(?<!\\)"', body, re.S)
+    if m:
+        return _tidy_title(m.group(1))
+    bi = re.search(r"\\bibinfo\s*\{title\}\s*\{", body)
+    if bi:
+        return _tidy_title(_braced(body, bi.end()) or "")
+    if r"\newblock" in body:
+        seg = re.split(r"\\newblock\b", body)[1].strip()
+        # A segment that opens with the venue or a link means the entry had no title.
+        if re.match(r"(?:In\b|\\url|\\href|\\doi|\\urlprefix)", seg):
+            return ""
+        return _tidy_title(seg)
+    return None
+
+
+def _bibitem_emph_guess(body):
+    r"""A title GUESSED from the first \emph{}/\textit{}. Guessed, because \emph{} holds the
+    title in some styles and the journal or "et al." in others, and nothing in the entry
+    says which. verify() therefore never lets a guessed title produce MISMATCH.
+
+    The 6-character floor stays because it is a guess, but the scan must count braces:
+    `[^{}]` could not cross the inner braces of `\emph{On {BIC} states}`, so a title
+    carrying LaTeX case protection or inline math was dropped entirely.
+    """
+    for em in re.finditer(r"\\(?:emph|textit|textsl|textbf)\s*\{", body):
+        raw = _braced(body, em.end())
+        if raw is None or not 6 <= len(raw) <= 300 or r"\bibinfo" in raw:
+            continue
+        return _tidy_title(raw)
+    return ""
 
 
 def parse_bibitem(text):
@@ -322,36 +483,9 @@ def parse_bibitem(text):
         # correct references as MISMATCH (match 0.14) on 2026-08-25. A parser
         # that manufactures false positives fails a correct paper under --gate,
         # which is the same defect as one that passes a wrong one.
-        title = ""
-        # An explicit ``...'' or "..." IS the title, however short, so the floor here is 2.
-        # At 6 it silently dropped ``Chaos'' and ``Two'', and a reference with no parsed
-        # title gets no MISMATCH check at all.
-        m = re.search(r"``(.{2,300}?)''", body, re.S)
-        if not m:
-            m = re.search(r'"(.{2,300}?)"', body, re.S)
-        raw = m.group(1) if m else ""
-        if not raw:
-            # The emph fallback stays conservative (6 chars) because it is a guess, but it
-            # must count braces: `[^{}]` could not cross the inner braces of
-            # `\emph{On {BIC} states}`, so a title carrying LaTeX case protection or inline
-            # math was dropped entirely. Same defect the bibtex field() parser already fixed.
-            em = re.search(r"\\(?:emph|textit|textsl|textbf)\s*\{", body)
-            if em:
-                depth, j = 1, em.end()
-                while j < len(body) and depth:
-                    if body[j] == "{":
-                        depth += 1
-                    elif body[j] == "}":
-                        depth -= 1
-                    j += 1
-                if not depth and 6 <= j - 1 - em.end() <= 300:
-                    raw = body[em.end() : j - 1]
-        if raw:
-            title = re.sub(r"\s+", " ", raw).strip().rstrip(".,")
-            # Bibliographies use these where a title would sit; none of them is one.
-            if re.fullmatch(r"(?:et\s+al\.?|ibid\.?|op\.\s*cit\.?|eds?\.?|"
-                            r"[\W\d_]+)", title, re.I):
-                title = ""
+        title, guessed = _bibitem_title(body), False
+        if title is None:
+            title, guessed = _bibitem_emph_guess(body), True
         doi = ""
         md = re.search(DOI_RE, body)
         if md:
@@ -371,6 +505,7 @@ def parse_bibitem(text):
                 "doi": doi,
                 "arxiv": arx,
                 "title": title,
+                "title_guess": guessed and bool(title),
                 "year": year,
             }
         )
@@ -592,7 +727,21 @@ def verify(ref):
     verifier, because it is trusted.
 
     So an ERRORED lookup now poisons the result: the reference stays UNCHECKABLE and says
-    why. Refusing to answer is the only honest output when the oracle is unreachable."""
+    why. Refusing to answer is the only honest output when the oracle is unreachable.
+
+    The same asymmetry applies to the PARSER. A title the parser had to guess is evidence
+    of nothing, so a disagreement with it is SUSPECT, never MISMATCH."""
+    # A title with no comparable characters (`{\`, `$$`, `--`) is no title. Compared as
+    # one it scored 0.00 against the registry and read MISMATCH.
+    title = ref["title"] if norm(ref["title"]) else ""
+    cls, why = _verify(dict(ref, title=title))
+    if cls == "MISMATCH" and ref.get("title_guess"):
+        return "SUSPECT", (why + " -- but the cited title was only GUESSED from \\emph{} and "
+                           "may be the venue; check this reference by hand")
+    return cls, why
+
+
+def _verify(ref):
     degraded = None
     if ref["doi"]:
         cls, why = check_doi(ref["doi"], ref["title"])

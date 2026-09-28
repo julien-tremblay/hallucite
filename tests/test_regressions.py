@@ -517,5 +517,116 @@ finally:
 # 28. The parser fixtures built into hallucite.py only ran under the live --selftest.
 check("the built-in parser fixtures pass offline", H.selftest_parsers())
 
+
+# --- round 6: a title the parser had to guess is evidence of nothing ------------------
+#
+# The network layer refuses to accuse on missing evidence. The parsers did not: a wrong
+# title guess went straight into the comparison, and a wrong title against a correct DOI
+# is a MISMATCH -- a hard failure on a correct reference. Found by audit 2026-09-28.
+
+# 29. The .bbl that BibTeX writes for natbib users. The venue sits in \emph{}, the title in
+#     the first \newblock, and the parser took the \emph{}: every reference with a DOI came
+#     back MISMATCH against "Nature" or "Proceedings of the IEEE Conference on ...".
+PLAINNAT = r"""\begin{thebibliography}{3}
+\bibitem[LeCun et~al.(2015)LeCun, Bengio, and Hinton]{lecun}
+Yann LeCun, Yoshua Bengio, and Geoffrey Hinton.
+\newblock Deep learning.
+\newblock \emph{Nature}, 521\penalty0 (7553):\penalty0 436--444, 2015.
+\newblock \doi{10.1038/nature14539}.
+
+\bibitem[He et~al.(2016)He, Zhang, Ren, and Sun]{he}
+Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun.
+\newblock Deep residual learning for image recognition.
+\newblock In \emph{Proceedings of the IEEE Conference on Computer Vision and Pattern
+  Recognition}, pages 770--778, 2016.
+\newblock \doi{10.1109/cvpr.2016.90}.
+
+\bibitem[Bishop(2006)]{bishop}
+Christopher~M. Bishop.
+\newblock \emph{Pattern Recognition and Machine Learning}.
+\newblock Springer, 2006.
+\end{thebibliography}"""
+refs = H.parse_bibitem(PLAINNAT)
+check("plainnat .bbl: titles come from the first \\newblock, not the \\emph{} venue",
+      [r["title"] for r in refs] == ["Deep learning", "Deep residual learning for image recognition",
+                                     "Pattern Recognition and Machine Learning"],
+      f"got {[r['title'] for r in refs]}")
+BBL_REG = Registry(crossref={"10.1038/nature14539": "Deep learning",
+                             "10.1109/cvpr.2016.90": "Deep Residual Learning for Image Recognition",
+                             "10.1103/physrevlett.88.057902":
+                             "Continuous Variable Quantum Cryptography Using Coherent States"})
+got = [verify(BBL_REG, **{k: r[k] for k in ("doi", "title", "title_guess")})[0] for r in refs[:2]]
+check("...and a correct plainnat .bbl is OK", got == ["OK", "OK"], f"got {got}")
+swapped = dict(refs[0], doi="10.1103/physrevlett.88.057902")
+cls, _ = verify(BBL_REG, **{k: swapped[k] for k in ("doi", "title", "title_guess")})
+check("...while a swapped DOI in it is still MISMATCH", cls == "MISMATCH", f"got {cls}")
+
+# 30. ACM and REVTeX .bbl files tag the title explicitly. REVTeX puts the JOURNAL in
+#     \emph{\bibinfo{journal}{...}}, which must not be guessed as a title either.
+r = H.parse_bibitem(r"\bibitem{a} \bibfield{author}{\bibinfo{person}{Y. LeCun}}."
+                    r" \newblock \bibinfo{title}{Deep learning}. \newblock"
+                    r" \bibinfo{journal}{\emph{Nature}} (2015).")
+check("\\bibinfo{title} is read", r and r[0]["title"] == "Deep learning", f"got {r and r[0]['title']!r}")
+r = H.parse_bibitem(r"\bibitem{a} \bibfield{author}{A. B.}, \emph{\bibinfo{journal}{Phys. Rev. Lett.}}"
+                    r" \textbf{\bibinfo{volume}{88}}, 057902 (2002)")
+check("REVTeX's \\emph{\\bibinfo{journal}} is not guessed as a title", r and r[0]["title"] == "",
+      f"got {r and r[0]['title']!r}")
+
+# 31. \" is an umlaut, not a quotation mark. `Schr\"odinger and G\"odel` parsed as the title
+#     `odinger and K.~G\`, which read MISMATCH against the paper's DOI.
+r = H.parse_bibitem(r"\bibitem{s} E.~Schr\"odinger and K.~G\"odel, Die gegenw\"artige Situation,"
+                    r" Naturwiss. 23, 807 (1935), doi:10.1007/bf01491891.")
+check("umlaut escapes are not read as quotes", r and "odinger" not in r[0]["title"],
+      f"got {r and r[0]['title']!r}")
+r = H.parse_bibitem(r'\bibitem{s} E.~Schr\"odinger, "Die gegenw\"artige Situation," Naturwiss. (1935).')
+check("...and a quoted title may contain one", r and r[0]["title"] == r'Die gegenw\"artige Situation',
+      f"got {r and r[0]['title']!r}")
+
+# 32. \emph{} holds the title in some styles and the journal in others, and nothing in the
+#     entry says which. A guess may raise SUSPECT; it must never raise MISMATCH.
+r = H.parse_bibitem(r"\bibitem{x} A. Author, \emph{Physical Review Letters} \textbf{88}, 057902 (2002),"
+                    r" doi:10.1103/physrevlett.88.057902.")
+check("an \\emph{} title is marked as a guess", r and r[0]["title_guess"], f"got {r}")
+PRL = Registry(crossref={"10.1103/physrevlett.88.057902":
+                         "Continuous Variable Quantum Cryptography Using Coherent States"})
+cls, why = verify(PRL, doi=r[0]["doi"], title=r[0]["title"], title_guess=True)
+check("a guessed title that disagrees is SUSPECT, not MISMATCH", cls == "SUSPECT", f"got {cls}: {why}")
+rc, out = run_main({"refs.tex": r"\begin{thebibliography}{1}" + "\n" + r"\bibitem{x} A. Author,"
+                    r" \emph{Physical Review Letters} \textbf{88}, 057902 (2002),"
+                    r" doi:10.1103/physrevlett.88.057902." + "\n" + r"\end{thebibliography}"},
+                   "--gate", reg=PRL)
+check("...so it does not fail the gate", rc == 0 and "[SUSP]" in out, f"got exit {rc}: {out}")
+
+# 33. BibTeX requires `{\"U}` in a quoted field precisely because a bare `\"` would end it.
+#     The field parser stopped at that `"` anyway: the title parsed as `{\`, scored 0.00,
+#     and a correct reference to Goedel's 1931 paper read MISMATCH.
+GODEL = "Über formal unentscheidbare Sätze der Principia Mathematica und verwandter Systeme I"
+r = H.parse_bib('@article{g, title = "{\\"U}ber formal unentscheidbare S{\\"a}tze der Principia '
+                'Mathematica und verwandter Systeme I", doi = {10.1007/BF01700692}}')
+check("a quoted field keeps going past a braced \\\"", r and r[0]["title"].endswith("Systeme I"),
+      f"got {r and r[0]['title']!r}")
+cls, why = verify(Registry(crossref={"10.1007/bf01700692": GODEL}), doi=r[0]["doi"], title=r[0]["title"])
+check("...and the reference is OK", cls == "OK", f"got {cls}: {why}")
+
+# 34. @string macros were never expanded, so `title = t1` was compared as the title "t1".
+r = H.parse_bib("@string{dl = {Deep learning}}\n@string{sub = dl # \": A Review\"}\n"
+                "@article{a, title = dl, doi = {10.1/a}}\n@article{b, title = sub}\n"
+                "@article{c, title = undefined_macro, doi = {10.1/c}}\n")
+check("@string macros are expanded, including # concatenation",
+      [x["title"] for x in r] == ["Deep learning", "Deep learning: A Review", ""],
+      f"got {[x['title'] for x in r]}")
+
+# 35. @article(key, ...) is legal BibTeX and was silently dropped from a mixed file. An `@`
+#     inside a field value must not open a phantom entry either.
+r = H.parse_bib('@article{a, title={One}}\n@article(b, title = "Two (and a half)", doi={10.9999/x})\n'
+                "@misc{c, title={Three}, note={mail me@home{} please}}\n")
+check("parenthesis-delimited entries are parsed",
+      [(x["key"], x["title"]) for x in r] == [("a", "One"), ("b", "Two (and a half)"), ("c", "Three")],
+      f"got {[(x['key'], x['title']) for x in r]}")
+
+# 36. A title with no comparable characters is no title. It scored 0.00 and read MISMATCH.
+cls, why = verify(NATURE, doi="10.1038/nature14539", title="{\\")
+check("a title that normalises to nothing is not compared", cls == "OK", f"got {cls}: {why}")
+
 print(f"\n{'ALL PASS' if not FAILS else str(len(FAILS)) + ' FAILED: ' + ', '.join(FAILS)}")
 sys.exit(0 if not FAILS else 1)
