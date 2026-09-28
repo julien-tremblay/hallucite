@@ -22,6 +22,10 @@ import hallucite as H  # noqa: E402
 
 FAILS = []
 HAL = str(pathlib.Path(__file__).resolve().parent.parent / "hallucite.py")
+# Nothing in this process talks to a real registry, so nothing should wait for one. The
+# arXiv client spaces requests three seconds apart, as arXiv asks, and without this every
+# in-process arXiv lookup made the suite sleep for real. Tests that time things patch it.
+H.time.sleep = lambda s: None
 
 
 def check(name, cond, detail=""):
@@ -37,12 +41,14 @@ class Registry:
     earlier tests each patched H._get with a one-off lambda, which is how the MISMATCH
     branch -- the point of the tool -- went without a single offline test."""
 
-    def __init__(self, crossref=None, search=(), doi_org=None, arxiv=None, arxiv_raw=None):
+    def __init__(self, crossref=None, search=(), doi_org=None, arxiv=None, arxiv_raw=None,
+                 arxiv_search=()):
         self.crossref = crossref or {}   # doi -> title, or a full Crossref `message` dict
         self.search = list(search)       # titles a Crossref bibliographic query returns
         self.doi_org = doi_org or {}     # doi -> CSL-JSON, for DOIs outside Crossref
         self.arxiv = arxiv or {}         # id -> title
         self.arxiv_raw = arxiv_raw       # a raw arXiv response body, to simulate outages
+        self.arxiv_search = list(arxiv_search)  # titles an arXiv title search returns
         self.calls = []
 
     def __call__(self, url, accept="application/json"):
@@ -65,7 +71,10 @@ class Registry:
         if "export.arxiv.org" in url:
             if self.arxiv_raw is not None:
                 return self.arxiv_raw, 200
-            aid = url.split("id_list=")[1].split("&")[0]
+            if "search_query=" in url:
+                entries = "".join(f"<entry><title>{t}</title></entry>" for t in self.arxiv_search)
+                return f"<feed><title>ArXiv Query</title>{entries}</feed>", 200
+            aid = urllib.parse.unquote(url.split("id_list=")[1].split("&")[0])
             entry = f"<entry><title>{self.arxiv[aid]}</title></entry>" if aid in self.arxiv else ""
             return f"<feed><title>ArXiv Query</title>{entry}</feed>", 200
         raise AssertionError(f"unexpected URL {url}")
@@ -345,6 +354,8 @@ def _mock(doi_404=True, best_title=None, title_oracle_ok=True):
                 raise urllib_error.HTTPError(url, 503, "down", {}, None)
             items = [{"title": [best_title]}] if best_title else []
             return _j2.dumps({"message": {"items": items}}), 200
+        if "export.arxiv.org" in url:
+            return "<feed><title>ArXiv Query</title></feed>", 200
         raise urllib_error.HTTPError(url, 404, "Not Found", {}, None)
     return g
 
@@ -627,6 +638,103 @@ check("parenthesis-delimited entries are parsed",
 # 36. A title with no comparable characters is no title. It scored 0.00 and read MISMATCH.
 cls, why = verify(NATURE, doi="10.1038/nature14539", title="{\\")
 check("a title that normalises to nothing is not compared", cls == "OK", f"got {cls}: {why}")
+
+
+# --- round 7: the arXiv path, where nothing had been ported ----------------------------
+#
+# Every guard added to the Crossref path -- a 200 that is not data is an outage, an id is
+# only an id where it is cited as one, a dead identifier is not a dead paper -- was missing
+# from the arXiv path. Found by audit 2026-09-28.
+
+# 37. An arXiv id is taken only where the text CITES one. The bibtex parser searched the whole
+#     entry for anything id-shaped whenever "arxiv" appeared in it: an IEEE Xplore URL gave
+#     document/8765432, a Zenodo URL record/1234567, and a real paper read FABRICATED.
+for label, entry in [
+        ("an IEEE Xplore URL", "url={https://ieeexplore.ieee.org/document/8765432}, note={on arXiv}"),
+        ("a Zenodo URL", "url={https://zenodo.org/record/1234567}, note={also on arXiv}"),
+        ("the digits of a DOI", "doi={10.1145/3292500.3330701}, note={arXiv version}"),
+        ("a non-arXiv eprint", "eprinttype={hdl}, eprint={1234.56789}, note={arXiv}")]:
+    r = H.parse_bib("@misc{a, title={X}, %s}" % entry)
+    check(f"{label} is not an arXiv id", r and r[0]["arxiv"] == "", f"got {r and r[0]['arxiv']!r}")
+for label, entry, want in [
+        ("eprint with prefix and version", "eprint={arXiv:1706.03762v5}", "1706.03762"),
+        ("archiveprefix + eprint", "archiveprefix={arXiv}, eprint={hep-th/9901001}", "hep-th/9901001"),
+        ("Google Scholar's journal field", "journal={arXiv preprint arXiv:1706.03762}", "1706.03762"),
+        ("an arxiv.org URL", "url={https://arxiv.org/abs/1706.03762}", "1706.03762"),
+        ("an arXiv DOI", "doi={10.48550/arXiv.1706.03762}", "1706.03762")]:
+    r = H.parse_bib("@misc{a, title={X}, %s}" % entry)
+    check(f"{label} gives the arXiv id", r and r[0]["arxiv"] == want, f"got {r and r[0]['arxiv']!r}")
+# Without digit boundaries a typo is truncated into a DIFFERENT, real id: arXiv:1706.037621
+# became 1706.03762, and the reference was then judged against somebody else's paper.
+for typo in ["arXiv:1706.037621", "arXiv:12345.6789"]:
+    got = H.parse_inline(typo)
+    check(f"a malformed id is not truncated into a real one ({typo})", got == [], f"got {got}")
+got = [x["arxiv"] for x in H.parse_inline("preprints: https://arxiv.org/abs/1706.03762v2 and "
+                                          "https://arxiv.org/pdf/1810.04805.pdf")]
+check("arxiv.org URLs in prose are references", got == ["1706.03762", "1810.04805"], f"got {got}")
+
+# 38. A 200 that is not an Atom feed is an outage. It carried no <entry>, which read as "no
+#     record", and a real paper came back FABRICATED while arXiv was showing a rate-limit page.
+cls, why = verify(Registry(arxiv_raw="<html><body>Rate exceeded.</body></html>"),
+                  arxiv="1706.03762", title="Attention Is All You Need")
+check("an arXiv 200 that is not a feed is UNCHECKABLE, not FABRICATED",
+      cls == "UNCHECKABLE" and H.NO_ORACLE in why, f"got {cls}: {why}")
+
+# 39. arXiv reports a malformed id as an entry titled "Error". Read as a record, an inline id
+#     with no title to compare -- the only kind prose has -- came back OK.
+ERR = ("<feed><entry><id>http://arxiv.org/api/errors#incorrect_id_format_for_2413.99999</id>"
+       "<title>Error</title><summary>incorrect id format for 2413.99999</summary></entry></feed>")
+cls, why = verify(Registry(arxiv_raw=ERR), arxiv="2413.99999")
+check("arXiv's error entry is not a record", cls == "FABRICATED", f"got {cls}: {why}")
+
+# 40. An empty feed is asked again once before it becomes an accusation, and every arXiv
+#     request goes over https (the old plain-http query let anyone on the path rewrite it).
+reg = Registry()
+verify(reg, arxiv="2101.99999")
+arx_calls = [u for u in reg.calls if "arxiv" in u]
+check("an empty arXiv answer is re-asked once", len(arx_calls) == 2, f"got {len(arx_calls)}")
+check("arXiv is queried over https", arx_calls and all(u.startswith("https://") for u in arx_calls),
+      f"got {arx_calls}")
+
+# 41. arXiv asks for one request every three seconds; everything was paced at 0.25 s.
+naps, real_sleep, real_mono = [], H.time.sleep, H.time.monotonic
+H.time.sleep, H.time.monotonic = naps.append, (lambda: 1000.0)
+H._arxiv_last[0] = 999.0
+real_get, H._get = H._get, (lambda url, accept=None: ("<feed></feed>", 200))
+try:
+    H._arxiv_get("id_list=1706.03762")
+finally:
+    H._get, H.time.sleep, H.time.monotonic = real_get, real_sleep, real_mono
+check("consecutive arXiv requests are three seconds apart", naps == [2.0], f"slept {naps}")
+
+# 42. The subject class of an old-style id is not part of it: math.AG/0512013 is math/0512013.
+cls, why = verify(Registry(arxiv={"math/0512013": "Some Algebraic Geometry"}),
+                  arxiv="math.AG/0512013", title="Some Algebraic Geometry")
+check("an old-style id with a subject class resolves", cls == "OK", f"got {cls}: {why}")
+
+# 43. A dead DOI next to a live arXiv id. The arXiv id was never asked, and a real preprint
+#     cited with a mistyped DOI came back FABRICATED with its own arXiv id in the entry.
+BERT = "BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding"
+ref = dict(doi="10.5555/1234567.7654321", arxiv="1810.04805", title=BERT)
+cls, why = verify(Registry(arxiv={"1810.04805": BERT}), **ref)
+check("a dead DOI with a live arXiv id is BAD-DOI", cls == "BAD-DOI", f"got {cls}: {why}")
+cls, why = verify(Registry(arxiv={}), **ref)
+check("...a dead DOI with a dead arXiv id is FABRICATED", cls == "FABRICATED", f"got {cls}: {why}")
+cls, why = verify(Registry(arxiv_raw="<html>down</html>"), **ref)
+check("...and with arXiv unreachable it is half a check", cls == "UNCHECKABLE" and H.NO_ORACLE in why,
+      f"got {cls}: {why}")
+
+# 44. The rescue asked only Crossref, which holds few of the conference papers that carry a
+#     dead ACM 10.5555 DOI. arXiv holds most of them. A mistyped arXiv id is rescued the
+#     same way a dead DOI is; it used to be FABRICATED with no title check at all.
+cls, why = verify(Registry(arxiv_search=[BERT]), doi="10.5555/1234567.7654321", title=BERT)
+check("a dead DOI whose title is on arXiv is BAD-DOI", cls == "BAD-DOI" and "arXiv match" in why,
+      f"got {cls}: {why}")
+cls, why = verify(Registry(arxiv_search=[BERT]), arxiv="1810.99999", title=BERT)
+check("a dead arXiv id whose title is real is BAD-DOI", cls == "BAD-DOI", f"got {cls}: {why}")
+cls, why = verify(Registry(arxiv_raw="<html>down</html>"), doi="10.5555/1234567.7654321", title=BERT)
+check("a rescue with one source down and no match is half a check",
+      cls == "UNCHECKABLE" and H.NO_ORACLE in why, f"got {cls}: {why}")
 
 print(f"\n{'ALL PASS' if not FAILS else str(len(FAILS)) + ' FAILED: ' + ', '.join(FAILS)}")
 sys.exit(0 if not FAILS else 1)

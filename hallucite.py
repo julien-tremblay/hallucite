@@ -32,6 +32,7 @@ Grounding lives in the REGISTRY, never the language. Advisory by default; wire i
 """
 
 import difflib
+import html
 import json
 import os
 import re
@@ -61,8 +62,17 @@ NO_ORACLE = "oracle unavailable: "
 # side, not a defect in the bibliography, so it is soft and does not fail the gate. Both
 # stop verify() from falling through to a weaker check, for opposite reasons.
 NO_TITLE = "resolved but unverifiable: "
-# arXiv id: new-style 2101.01234[v2] OR old-style quant-ph/0101012, math.AG/0512013
-ARXIV_RE = r"(\d{4}\.\d{4,5}|[a-z-]+(?:\.[A-Z]{2})?/\d{7})"
+# arXiv id: new-style 2101.01234[v2] OR old-style quant-ph/0101012, math.AG/0512013. The
+# trailing boundary matters: without it the typo arXiv:1706.037621 was truncated into
+# 1706.03762, a different real paper, and judged against it.
+ARXIV_RE = r"(\d{4}\.\d{4,5}(?!\d)|[a-z-]+(?:\.[A-Z]{2})?/\d{7}(?!\d))"
+# Where an arXiv id may be taken from: text that CITES it as one. The bibtex parser used to
+# search the whole entry for anything id-shaped whenever the word "arxiv" appeared in it,
+# so an IEEE Xplore URL gave `document/8765432`, a Zenodo URL gave `record/1234567`, and a
+# real paper came back FABRICATED ("arXiv:document/8765432 has no record"). Audit
+# 2026-09-28. The DOI form 10.48550/arXiv.* is DataCite's and names the same paper.
+ARXIV_CITED = re.compile(r"(?:\barXiv\s*:\s*|arxiv\.org/(?:abs|pdf)/|10\.48550/arXiv\.)"
+                         + ARXIV_RE, re.I)
 # Crossref restricted the DOI suffix charset in 2008 but never invalidated what was already
 # minted, so `<`, `>`, `#` and `+` are legal in pre-2008 DOIs. Wiley's SICI form is the
 # common case and it is not rare: 99 of 100 Angewandte Chemie records from 2000-2002 carry
@@ -358,14 +368,18 @@ def parse_bib(text):
             dm = re.search(DOI_RE, body)
             if dm:
                 doi = clean_doi(dm.group(0))
-        eprint = field("eprint", raw_words=True)
-        # arXiv id: new-style (2101.01234) OR old-style (quant-ph/0101012, math.AG/0512013)
+        # An eprint field is an arXiv id unless the entry says it belongs to another archive
+        # (biblatex `eprinttype = {hdl}`, `archiveprefix = {HAL}`), and only if it IS one.
         arxiv = ""
-        am = re.search(ARXIV_RE, eprint)
-        if not am and "arxiv" in body.lower():
-            am = re.search(ARXIV_RE, body)
-        if am:
-            arxiv = am.group(1)
+        archive = (field("eprinttype", True) or field("archiveprefix", True)).lower()
+        em = re.fullmatch(r"\s*(?:arXiv\s*:\s*)?" + ARXIV_RE + r"(?:v\d+)?\s*",
+                          field("eprint", raw_words=True), re.I)
+        if em and archive in ("", "arxiv"):
+            arxiv = em.group(1)
+        else:
+            am = ARXIV_CITED.search(body)
+            if am:
+                arxiv = am.group(1)
         refs.append(
             {
                 "key": key,
@@ -491,7 +505,7 @@ def parse_bibitem(text):
         if md:
             doi = clean_doi(md.group(0).lower())
         arx = ""
-        ma = re.search(r"arXiv:\s*(" + ARXIV_RE + ")", body, re.I)
+        ma = ARXIV_CITED.search(body)
         if ma:
             arx = ma.group(1)
         year = ""
@@ -526,7 +540,12 @@ def parse_inline(text):
                 "year": "",
             }
         )
-    for a in sorted(set(re.findall(r"arXiv:\s*" + ARXIV_RE, text, re.I))):
+    # An arXiv DOI (10.48550/arXiv.*) is already checked as a DOI above; only the `arXiv:`
+    # and arxiv.org URL forms add an arXiv reference. The URL form was not recognised at
+    # all, so a markdown paper linking its preprints listed none of them.
+    cited = {m.group(1) for m in ARXIV_CITED.finditer(text)
+             if not m.group(0).lower().startswith("10.48550")}
+    for a in sorted(cited):
         refs.append(
             {
                 "key": "arXiv:" + a,
@@ -561,7 +580,9 @@ def check_doi(doi, claimed_title):
             )
         except urllib.error.HTTPError as e2:
             if e2.code == 404:
-                return _unresolvable(doi, claimed_title)
+                return _unresolvable(
+                    f"DOI {doi} does not resolve at doi.org (all registration agencies)",
+                    f"DOI {doi}", claimed_title)
             return "UNCHECKABLE", NO_ORACLE + f"doi.org HTTP {e2.code}"
         except Exception as e2:  # noqa: BLE001
             return "UNCHECKABLE", NO_ORACLE + f"doi.org {type(e2).__name__}"
@@ -614,18 +635,66 @@ def check_doi(doi, claimed_title):
     )
 
 
-def check_arxiv(aid, claimed_title):
+_ARXIV_API = "https://export.arxiv.org/api/query?"
+_arxiv_last = [0.0]
+
+
+def _arxiv_get(query):
+    """arXiv asks API clients for at most one request every three seconds. The tool paced
+    every registry at 0.25 s, so an arXiv-heavy bibliography invited 429s and, at worst,
+    a blocked address. The query also went out over plain http, where anyone on the path
+    could rewrite the verdict. Audit 2026-09-28."""
+    wait = _arxiv_last[0] + 3.0 - time.monotonic()
+    if wait > 0:
+        time.sleep(wait)
     try:
-        body, _ = _get(f"http://export.arxiv.org/api/query?id_list={aid}&max_results=1")
+        return _get(_ARXIV_API + query)
+    finally:
+        _arxiv_last[0] = time.monotonic()
+
+
+def _arxiv_entries(query):
+    """(entries, None) from the arXiv API, or (None, reason) if it did not answer."""
+    try:
+        body, _ = _arxiv_get(query)
     except urllib.error.HTTPError as e:
-        return "UNCHECKABLE", NO_ORACLE + f"arXiv HTTP {e.code}"
+        return None, NO_ORACLE + f"arXiv HTTP {e.code}"
     except Exception as e:  # noqa: BLE001
-        return "UNCHECKABLE", NO_ORACLE + f"arXiv {type(e).__name__}"
-    entries = re.findall(r"<entry>(.*?)</entry>", body, re.S)
-    if not entries:
-        return "FABRICATED", f"arXiv:{aid} has no record"
-    tm = re.search(r"<title>(.*?)</title>", entries[0], re.S)
-    found = re.sub(r"\s+", " ", tm.group(1)).strip() if tm else ""
+        return None, NO_ORACLE + f"arXiv {type(e).__name__}"
+    # A 200 that is not an Atom feed is a maintenance or rate-limit page. It carries no
+    # <entry>, and check_arxiv read that as "no record": a real paper came back FABRICATED
+    # during an outage -- the failure already fixed for Crossref's non-JSON 200, never
+    # ported here. Audit 2026-09-28.
+    if "<feed" not in body:
+        return None, NO_ORACLE + "arXiv answered with something that is not an Atom feed"
+    return re.findall(r"<entry>(.*?)</entry>", body, re.S), None
+
+
+def _entry_title(entry):
+    tm = re.search(r"<title[^>]*>(.*?)</title>", entry, re.S)
+    return html.unescape(re.sub(r"\s+", " ", tm.group(1)).strip()) if tm else ""
+
+
+def check_arxiv(aid, claimed_title):
+    # The subject class in an old-style id is not part of the identifier: math.AG/0512013
+    # is math/0512013.
+    qid = re.sub(r"^([a-z-]+)\.[A-Za-z]{2}/", r"\1/", aid)
+    for _attempt in range(2):
+        entries, why = _arxiv_entries(f"id_list={urllib.parse.quote(qid)}&max_results=1")
+        if entries is None:
+            return "UNCHECKABLE", why
+        # arXiv reports a malformed id as an entry whose <id> is its own error page, titled
+        # "Error". Read as a record, that is an OK for a fabricated inline id with no title.
+        errors = [e for e in entries if "/api/errors" in e]
+        records = [e for e in entries if "/api/errors" not in e and _entry_title(e)]
+        if records or errors:
+            break
+        # An empty feed is asked again once before it becomes an accusation. API users report
+        # empty answers for valid ids under load; this was not reproduced, only guarded.
+    if not records:
+        reason = "arXiv rejects the id as malformed" if errors else "arXiv has no record of it"
+        return _unresolvable(f"arXiv:{aid}: {reason}", f"arXiv:{aid}", claimed_title)
+    found = _entry_title(records[0])
     if not claimed_title:
         return "OK", f"arXiv resolves: {found[:70]}"
     r = title_match(claimed_title, found)
@@ -667,6 +736,47 @@ def _title_lookup(title):
     return best, found
 
 
+def _arxiv_title_lookup(title):
+    """Best arXiv match for a title, same contract as _title_lookup."""
+    words = norm(title)[:12]
+    if not words:
+        return 0.0, ""
+    q = urllib.parse.quote('ti:"' + " ".join(words) + '"')
+    entries, why = _arxiv_entries(f"search_query={q}&max_results=10")
+    if entries is None:
+        return None, why
+    best, found = 0.0, ""
+    for e in entries:
+        cand = _entry_title(e)
+        r = title_match(title, cand) if "/api/errors" not in e else 0.0
+        if r > best:
+            best, found = r, cand
+    return best, found
+
+
+def _title_rescue(title):
+    """Is there a real work with this title? (score, found, where) or (None, reason, None).
+
+    Crossref alone could only rescue a paper Crossref holds. NeurIPS and ICML proceedings,
+    the usual home of a dead ACM 10.5555 DOI, are generally not Crossref-registered; most of
+    those papers are on arXiv. Audit 2026-09-28.
+
+    Any source that certifies the title is enough to rescue. Only when EVERY source answered
+    and none certified is the title unknown; if one could not answer, that is half a check.
+    """
+    best, found = _title_lookup(title)
+    if best is not None and best >= IDENTITY:
+        return best, found, "Crossref"
+    abest, afound = _arxiv_title_lookup(title)
+    if abest is not None and abest >= IDENTITY:
+        return abest, afound, "arXiv"
+    if best is None:
+        return None, found, None
+    if abest is None:
+        return None, afound, None
+    return max(best, abest), "", None
+
+
 def check_title(title):
     best, found = _title_lookup(title)
     if best is None:
@@ -681,14 +791,15 @@ def check_title(title):
     )
 
 
-def _unresolvable(doi, claimed_title):
-    """A DOI that resolves nowhere. Is the REFERENCE invented, or only the identifier?
+def _unresolvable(dead, ident, claimed_title):
+    """An identifier that resolves nowhere. Is the REFERENCE invented, or only the identifier?
 
     ACM's `10.5555/*` proceedings range is the standard case: `10.5555/3295222.3295349` is
     "Attention Is All You Need", it 404s at doi.org, and a flat FABRICATED verdict therefore
     accused the most-cited paper in modern machine learning of not existing. Publishers also
     mistype, retire and never register DOIs for work that plainly exists, and a reader who
-    is told their real reference is fake stops believing the tool on the one that is.
+    is told their real reference is fake stops believing the tool on the one that is. The
+    same holds for a mistyped arXiv id, which used to be FABRICATED with no title check.
 
     Consulting the title here is NOT the fallback verify() refuses. That refusal covers an
     oracle that failed to answer; this is an oracle that answered definitively. The bar is
@@ -696,19 +807,18 @@ def _unresolvable(doi, claimed_title):
     carries a plausible title, and a loose bar would launder exactly what this tool exists
     to catch.
     """
-    dead = f"DOI {doi} does not resolve at doi.org (all registration agencies)"
     if not claimed_title:
         return "FABRICATED", dead
-    best, found = _title_lookup(claimed_title)
+    best, found, where = _title_rescue(claimed_title)
     if best is None:
-        # Half a check is not a verdict: the DOI is definitively dead, but with no way to
-        # ask about the title we cannot tell a wrong identifier from an invented paper.
-        return "UNCHECKABLE", f"{found} -- {doi} resolves nowhere, title unverified"
-    if best >= IDENTITY:
-        return "BAD-DOI", (f"the paper is real (Crossref match {best:.2f}: "
-                           f"'{found[:50]}') but DOI {doi} resolves nowhere: wrong, "
+        # Half a check is not a verdict: the identifier is definitively dead, but with no way
+        # to ask about the title we cannot tell a wrong identifier from an invented paper.
+        return "UNCHECKABLE", f"{found} -- {ident} resolves nowhere, title unverified"
+    if where:
+        return "BAD-DOI", (f"the paper is real ({where} match {best:.2f}: "
+                           f"'{found[:50]}') but {ident} resolves nowhere: wrong, "
                            f"retired or never-registered identifier")
-    return "FABRICATED", f"{dead}, and no Crossref record matches the title (best {best:.2f})"
+    return "FABRICATED", f"{dead}, and no Crossref or arXiv record matches the title (best {best:.2f})"
 
 
 def verify(ref):
@@ -745,6 +855,20 @@ def _verify(ref):
     degraded = None
     if ref["doi"]:
         cls, why = check_doi(ref["doi"], ref["title"])
+        if cls == "FABRICATED" and ref["arxiv"]:
+            # The DOI is dead and the title matched nothing, but the entry also carries an
+            # arXiv id, and that was never asked. A real preprint cited with a mistyped DOI
+            # came back FABRICATED with its own arXiv id sitting in the entry. Audit
+            # 2026-09-28.
+            acls, awhy = check_arxiv(ref["arxiv"], ref["title"])
+            if acls == "OK":
+                return "BAD-DOI", (f"the paper is real ({awhy}, arXiv:{ref['arxiv']}) but "
+                                   f"DOI {ref['doi']} resolves nowhere: wrong, retired or "
+                                   f"never-registered identifier")
+            if acls == "UNCHECKABLE" and NO_ORACLE in awhy:
+                return "UNCHECKABLE", (f"DOI {ref['doi']} resolves nowhere and the arXiv id "
+                                       f"could not be checked: {awhy}")
+            return cls, f"{why}; arXiv:{ref['arxiv']} does not rescue it: {awhy}"
         if cls != "UNCHECKABLE":
             return cls, why
         if why.startswith(NO_TITLE):
@@ -831,7 +955,7 @@ def selftest():
             {
                 "doi": "10.9999/this.does.not.exist.999999",
                 "arxiv": "",
-                "title": "Fake paper",
+                "title": "Quantum Pretzel Bathymetry in Subarctic Systems",
                 "key": "t2",
             },
             "FABRICATED",
@@ -846,7 +970,10 @@ def selftest():
             "OK",
         ),
         (
-            {"doi": "", "arxiv": "9999.99999", "title": "Nonexistent", "key": "t4"},
+            # An invented title, not a generic one: a dead identifier is now checked against
+            # its title, and "Nonexistent" could be rescued by a real work of that name.
+            {"doi": "", "arxiv": "9999.99999", "key": "t4",
+             "title": "Quantum Wombat Onomastics in Triassic Systems"},
             "FABRICATED",
         ),
         (

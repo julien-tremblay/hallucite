@@ -7,7 +7,8 @@ DOIs with the right shape that point at nothing, or at a different paper entirel
 second kind is worse, because it survives a careful read.
 
 `hallucite` resolves every reference in a `.bib`, `.tex`, or `.md` file against the
-authoritative registries (Crossref for DOIs and titles, arXiv for eprints) and tells you
+authoritative registries (Crossref and doi.org for DOIs, arXiv for eprints, Crossref and
+arXiv for titles) and tells you
 which ones do not exist.
 
 ```
@@ -107,18 +108,26 @@ to fill the gap. A verifier that cries fraud during a network outage is worse th
 verifier, because you stop trusting it exactly when it is right.
 
 **A dead identifier is not a dead reference.** Publishers mistype, retire and never register
-DOIs for work that plainly exists, so a DOI that resolves nowhere is checked against its
-title before any verdict is passed. If the paper is real, you get `BAD-DOI`, which says fix
+DOIs for work that plainly exists, so a DOI or arXiv id that resolves nowhere is checked
+against its title, in Crossref and on arXiv, and against any other identifier in the same
+entry, before any verdict is passed. If the paper is real, you get `BAD-DOI`, which says fix
 the identifier, not `FABRICATED`, which says you made this up. ACM's `10.5555/*` range is the
 case that matters: `10.5555/3295222.3295349` is *Attention Is All You Need*, and it 404s.
-The bar for that rescue is 0.90 rather than the 0.60 used elsewhere, because a fabricated
-reference almost always carries a plausible title and a loose bar would launder exactly what
-this tool exists to catch.
+Conference papers that carry these DOIs are mostly not in Crossref at all, which is why arXiv
+is asked too. The bar for that rescue is 0.90 rather than the 0.60 used elsewhere, because a
+fabricated reference almost always carries a plausible title and a loose bar would launder
+exactly what this tool exists to catch. If one of the registries asked cannot answer and the
+others found nothing, the result is `UNCHECKABLE`, not a verdict.
 
 **The gate fails closed.** If no registry answered, `--gate` exits 1 and says so. Counting
 an unreachable oracle as a soft pass meant a fully offline run went green having verified
 nothing at all, which is the same reassuring green as a clean bibliography. A reference that
 simply carries no identifier is a different thing, and stays soft.
+
+**An identifier is only read where it is cited as one.** An arXiv id comes from an `eprint`
+field, an `arXiv:` prefix, an arxiv.org URL or an arXiv DOI, never from whatever id-shaped
+text an entry contains. Scanning the whole entry turned an IEEE Xplore URL into the arXiv id
+`document/8765432`, and a real paper into `FABRICATED`.
 
 **A registry's own gaps are not accusations.** A Crossref record with an empty title, or a
 DOI that resolves without readable metadata, reports `UNCHECKABLE` and says why. Comparing a
@@ -156,6 +165,8 @@ program, so there is nothing to hallucinate.
   than a paper that does not exist, this is not the tool.
 - Title matching is fuzzy (difflib ratio). A heavily abbreviated title can read as a
   `MISMATCH`.
+- arXiv asks API clients for one request every three seconds, and the tool obeys, so a
+  bibliography with fifty arXiv references takes a few minutes.
 - It checks that a reference *exists and matches*. It cannot check that the reference
   *supports the claim it is attached to*.
 
