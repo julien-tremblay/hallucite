@@ -33,9 +33,11 @@ Grounding lives in the REGISTRY, never the language. Advisory by default; wire i
 
 import difflib
 import html
+import http.client
 import json
 import os
 import re
+import socket
 import sys
 import time
 import unicodedata
@@ -120,6 +122,18 @@ def find_dois(text):
     return [clean_doi(m.group(0)).lower() for m in re.finditer(DOI_RE, text)]
 
 
+# A timeout or a dropped connection says nothing about the reference. Only 429 and 503 were
+# retried, so a single slow answer made a reference UNVERIFIED and failed --gate. A refused
+# connection or an unknown host is not transient in the same way, and is not retried.
+_TRANSIENT = (TimeoutError, socket.timeout, ConnectionResetError, ConnectionAbortedError,
+              http.client.RemoteDisconnected, http.client.IncompleteRead)
+
+
+def _polite():
+    """The polite-pool query parameter, URL-encoded: a `+` alias left raw reads as a space."""
+    return f"mailto={urllib.parse.quote(MAILTO)}" if MAILTO else ""
+
+
 def _get(url, accept="application/json"):
     """`accept` is a parameter because doi.org uses content negotiation: it needs
     application/vnd.citationstyles.csl+json to return metadata rather than a redirect
@@ -143,6 +157,10 @@ def _get(url, accept="application/json"):
             except (TypeError, ValueError):
                 delay = 2.0 * (attempt + 1)
             time.sleep(min(max(delay, 1.0), 10.0))
+        except _TRANSIENT + (urllib.error.URLError,) as e:
+            if not isinstance(getattr(e, "reason", e), _TRANSIENT) or attempt == 2:
+                raise
+            time.sleep(2.0 * (attempt + 1))
     raise urllib.error.URLError("retries exhausted")  # pragma: no cover
 
 
@@ -649,6 +667,19 @@ def parse_inline(text):
 
 
 # ---- verification ----------------------------------------------------------
+def _crossref_message(body):
+    """The `message` object of a Crossref answer, or None if the answer is not one.
+
+    A 200 carrying JSON that is not the expected object -- a proxy's `"maintenance"`, a
+    list -- raised AttributeError out of check_doi and killed the whole run with a
+    traceback: exit 1, the report lost. Audit 2026-09-28."""
+    try:
+        msg = json.loads(body).get("message")
+    except (ValueError, AttributeError):
+        return None
+    return msg if isinstance(msg, dict) else None
+
+
 # A `.` or `..` path segment is resolved by the server before the lookup, so the DOI
 # `10.1234/../../works/10.1038/nature14539` would be answered with the record of a different,
 # real DOI. No registered DOI needs one. Audit 2026-09-28; not tried against the live API.
@@ -661,7 +692,7 @@ def check_doi(doi, claimed_title):
                                            f"segment, which would be looked up as another DOI")
     try:
         body, status = _get(
-            f"https://api.crossref.org/works/{urllib.parse.quote(doi)}?mailto={MAILTO}"
+            f"https://api.crossref.org/works/{urllib.parse.quote(doi)}?{_polite()}"
         )
     except urllib.error.HTTPError as e:
         if e.code != 404:
@@ -669,13 +700,12 @@ def check_doi(doi, claimed_title):
         return _check_doi_elsewhere(doi, claimed_title)
     except Exception as e:  # noqa: BLE001
         return "UNCHECKABLE", NO_ORACLE + f"Crossref {type(e).__name__}"
-    try:
-        _j = json.loads(body)
-    except ValueError:
+    msg = _crossref_message(body)
+    if msg is None:
         # A 200 carrying an HTML maintenance or captcha page. This is an outage wearing a
         # success code, and it must poison the result rather than fall through.
         return "UNCHECKABLE", NO_ORACLE + "Crossref returned non-JSON (error page?)"
-    titles = _record_titles(_j.get("message", {}))
+    titles = _record_titles(msg)
     found = titles[0] if titles else ""
     if not claimed_title:
         return "OK", f"DOI resolves: {found[:70]}"
@@ -840,18 +870,20 @@ def _title_lookup(title):
             # rows=3 was too few to be a fair test: for "Attention Is All You Need" the
             # three exact Crossref records rank 8th, 9th and 10th, so the lookup saw only
             # near-misses and matched a DIFFERENT paper.
-            f"https://api.crossref.org/works?query.bibliographic={q}&rows=10&mailto={MAILTO}"
+            f"https://api.crossref.org/works?query.bibliographic={q}&rows=10&{_polite()}"
         )
     except urllib.error.HTTPError as e:
         return None, NO_ORACLE + f"Crossref HTTP {e.code}"
     except Exception as e:  # noqa: BLE001
         return None, NO_ORACLE + f"Crossref {type(e).__name__}"
-    try:
-        _j = json.loads(body)
-    except ValueError:
+    msg = _crossref_message(body)
+    items = msg.get("items") if msg else None
+    if not isinstance(items, list):
         return None, NO_ORACLE + "Crossref returned non-JSON (error page?)"
     best, found = 0.0, ""
-    for it in _j.get("message", {}).get("items", []):
+    for it in items:
+        if not isinstance(it, dict):
+            continue
         r, cand = _best_title(title, _record_titles(it))
         if r > best:
             best, found = r, cand
@@ -1201,6 +1233,14 @@ def parse_file(path, text):
 
 
 def main():
+    # Titles are printed, and a title can be in any script. Where stdout is not UTF-8 --
+    # Windows when output is piped, which is what CI does -- printing one raised
+    # UnicodeEncodeError and killed the run with exit 1. Audit 2026-09-28.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="backslashreplace")
+        except (AttributeError, ValueError):
+            pass
     # A misspelled flag used to be dropped silently, so `--gates` ran advisory and exited 0
     # while the caller believed they were gating. A gate you think you enabled and did not
     # is worse than no gate.
@@ -1258,7 +1298,15 @@ def main():
             continue
         print(f"\n== {path} ({len(refs)} refs) ==")
         for ref in refs:
-            cls, why = verify(ref)
+            try:
+                cls, why = verify(ref)
+            except Exception as e:  # noqa: BLE001
+                # One reference's bug must not take the report of every other one with it.
+                # An uncaught exception exited 1 -- under --gate indistinguishable from a
+                # fabricated reference -- and printed nothing after it. This fails the gate
+                # the same way, and keeps going.
+                cls, why = "UNCHECKABLE", NO_ORACLE + (f"internal error, please report it: "
+                                                       f"{type(e).__name__}: {e}")
             if cls == "OK" and not norm(ref["title"]):
                 # Markdown and bare .tex give identifiers without titles, and so does a
                 # bibtex entry with no title field. "OK" there means the identifier EXISTS,

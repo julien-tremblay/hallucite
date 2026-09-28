@@ -950,5 +950,87 @@ cls, why = verify(Registry(search=[{"title": ["Bidirectional Encoders"], "short-
                   doi="10.5555/dead.2", title="BERT")
 check("...but a short title cannot certify identity", cls == "FABRICATED", f"got {cls}: {why}")
 
+# --- round 12: nothing a registry or a terminal does may crash the run ------------------
+
+# 59. A 200 with JSON that is not the expected object raised AttributeError out of
+#     check_doi: a traceback, exit 1, and the report of every other reference lost.
+for body, paths in [('["unexpected"]', ("doi", "title")), ('"maintenance"', ("doi", "title")),
+                    ('{"message": ["x"]}', ("doi", "title")), ('{"message": {"items": "x"}}', ("title",))]:
+    got, crashed = [], None
+    try:
+        with registry(lambda u, accept=None, b=body: (b, 200)):
+            if "doi" in paths:
+                got.append(H.verify({"doi": "10.1/x", "arxiv": "", "title": "T", "year": "", "key": "k"}))
+            got.append(H.verify({"doi": "", "arxiv": "", "title": "Some Title", "year": "", "key": "k"}))
+    except Exception as e:  # noqa: BLE001
+        crashed = e
+    check(f"registry JSON {body} is an outage, not a crash",
+          crashed is None and all(c == "UNCHECKABLE" and H.NO_ORACLE in w for c, w in got),
+          f"crashed with {crashed!r}" if crashed else f"got {got}")
+
+# 60. One reference's bug must not take the report of every other one with it. It still
+#     fails the gate: a check that did not run is not a pass.
+real_check_doi = H.check_doi
+H.check_doi = lambda doi, title: (_ for _ in ()).throw(RuntimeError("boom")) if doi == "10.1234/boom" \
+    else real_check_doi(doi, title)
+try:
+    rc, out = run_main({"r.bib": "@article{a, title={X}, doi={10.1234/boom}}\n" + BIB}, "--gate", reg=NATURE)
+finally:
+    H.check_doi = real_check_doi
+check("an internal error on one reference is reported and the run goes on",
+      rc == 1 and "internal error" in out and "RuntimeError: boom" in out and "[ ok ] lecun" in out,
+      f"got exit {rc}: {out}")
+
+# 61. Where stdout is not UTF-8 -- Windows when output is piped -- printing a title in
+#     another script raised UnicodeEncodeError and killed the run. A file name will do.
+with tempfile.TemporaryDirectory() as d:
+    jp = pathlib.Path(d, "量子計算.bib")
+    jp.write_text("% no entries\n", encoding="utf-8")
+    p = subprocess.run([sys.executable, HAL, str(jp)], capture_output=True,
+                       env=dict(os.environ, PYTHONIOENCODING="cp1252"))
+check("a non-UTF-8 stdout does not crash the run", p.returncode == 0,
+      f"got exit {p.returncode}: {p.stderr[-200:]!r}")
+
+# 62. Only 429 and 503 were retried; one timeout made a reference UNVERIFIED and failed the
+#     gate. A refused connection is not transient in the same way and is not retried.
+def _urlopen_raising(*errors):
+    seen = []
+
+    def urlopen(req, timeout=None):
+        seen.append(req.full_url)
+        if len(seen) <= len(errors):
+            raise errors[len(seen) - 1]
+        return _Resp()
+    return urlopen, seen
+
+
+real_urlopen = H.urllib.request.urlopen
+try:
+    for label, err in [("a timeout", urllib.error.URLError(TimeoutError("timed out"))),
+                       ("a read timeout", TimeoutError("timed out")),
+                       ("a reset connection", ConnectionResetError("reset"))]:
+        H.urllib.request.urlopen, seen = _urlopen_raising(err)
+        body, status = H._get("https://api.crossref.org/works/10.1/x")
+        check(f"{label} is retried", status == 200 and len(seen) == 2, f"{len(seen)} attempts")
+    H.urllib.request.urlopen, seen = _urlopen_raising(urllib.error.URLError(ConnectionRefusedError()))
+    try:
+        H._get("https://api.crossref.org/works/10.1/x")
+        check("a refused connection is not retried", False, "no exception")
+    except urllib.error.URLError:
+        check("a refused connection is not retried", len(seen) == 1, f"{len(seen)} attempts")
+finally:
+    H.urllib.request.urlopen = real_urlopen
+
+# 63. The polite-pool address went into the URL unencoded, so a `+` alias read as a space.
+real_mailto = H.MAILTO
+H.MAILTO = "me+hallucite@example.org"
+try:
+    reg = Registry(crossref={"10.1038/nature14539": "Deep learning"})
+    verify(reg, doi="10.1038/nature14539", title="Deep learning")
+finally:
+    H.MAILTO = real_mailto
+check("the polite-pool address is URL-encoded", reg.calls and "mailto=me%2Bhallucite%40example.org" in reg.calls[0],
+      f"got {reg.calls}")
+
 print(f"\n{'ALL PASS' if not FAILS else str(len(FAILS)) + ' FAILED: ' + ', '.join(FAILS)}")
 sys.exit(0 if not FAILS else 1)

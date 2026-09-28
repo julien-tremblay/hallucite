@@ -48,7 +48,10 @@ hallucite --strict --gate *.bib # also fail on SUSPECT and on unidentifiable ref
 ```
 
 Without `--gate` the tool is advisory and always exits 0; read the summary line. Exit 2
-means a usage error (unknown flag, unreadable file), never a verdict.
+means a usage error (unknown flag, unreadable file), never a verdict. A malformed registry
+answer, a slow one, a terminal that cannot print a title, or a bug on one reference does not
+end the run: that reference is reported `UNCHECKABLE` with the reason, fails `--gate` like any
+check that did not run, and the rest are still checked.
 
 Drop it in a pre-commit hook or CI step and a fabricated reference stops being something
 you find out about from a reviewer.
