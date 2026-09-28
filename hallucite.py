@@ -105,6 +105,21 @@ def clean_doi(doi):
     return d.strip()
 
 
+# LaTeX escapes inside a DOI. `_` must be escaped in LaTeX text, and Mendeley escapes it in
+# .bib fields too, so 10.1162/tacl_a_00349 -- TACL, Neural Computation and Computational
+# Linguistics DOIs all carry underscores -- arrived as `10.1162/tacl\_a\_00349`. The bibtex
+# path sent the backslashes to the registry and the inline path cut the DOI at the first
+# one; either way it 404ed, and a real paper was FABRICATED unless its title happened to
+# be rescued. Audit 2026-09-28.
+_TEX_ESCAPE = re.compile(r"\{?\\(?:([_%#&])|textunderscore\b\s*(?:\{\})?)\}?")
+
+
+def find_dois(text):
+    """Every DOI in `text`, cleaned and lowercased (DOIs are case-insensitive)."""
+    text = _TEX_ESCAPE.sub(lambda m: m.group(1) or "_", text or "")
+    return [clean_doi(m.group(0)).lower() for m in re.finditer(DOI_RE, text)]
+
+
 def _get(url, accept="application/json"):
     """`accept` is a parameter because doi.org uses content negotiation: it needs
     application/vnd.citationstyles.csl+json to return metadata rather than a redirect
@@ -360,15 +375,15 @@ def parse_bib(text):
                 return ""
             return _bib_value(body, fm.end(), macros, raw_words) or ""
 
-        doi = clean_doi(field("doi", raw_words=True))
-        if not doi:
-            # @misc entries routinely park the DOI in `note` or `howpublished` rather than
-            # a `doi` field. The arXiv branch below already falls back to scanning the
-            # whole entry; the DOI branch did not, so a reference carrying a resolvable
-            # DOI in plain sight came back UNCHECKABLE.
-            dm = re.search(DOI_RE, body)
-            if dm:
-                doi = clean_doi(dm.group(0))
+        # The doi field is searched for a DOI rather than taken verbatim. Only a
+        # `https://doi.org/` prefix used to be stripped, so `http://dx.doi.org/...`,
+        # `doi:...` and `DOI: ...` -- all common in exports -- went to the registry as
+        # written, 404ed, and a real paper was FABRICATED unless its title was rescued.
+        # @misc entries routinely park the DOI in `note` or `howpublished` instead, so the
+        # whole entry is the fallback; a reference carrying a resolvable DOI in plain sight
+        # used to come back UNCHECKABLE.
+        dois = find_dois(field("doi", raw_words=True)) or find_dois(body)
+        doi = dois[0] if dois else ""
         # An eprint field is an arXiv id unless the entry says it belongs to another archive
         # (biblatex `eprinttype = {hdl}`, `archiveprefix = {HAL}`), and only if it IS one.
         arxiv = ""
@@ -385,7 +400,7 @@ def parse_bib(text):
             {
                 "key": key,
                 "type": etype,
-                "doi": doi.lower().replace("https://doi.org/", ""),
+                "doi": doi,
                 "arxiv": arxiv,
                 "title": field("title"),
                 "title_guess": False,
@@ -501,10 +516,8 @@ def parse_bibitem(text):
         title, guessed = _bibitem_title(body), False
         if title is None:
             title, guessed = _bibitem_emph_guess(body), True
-        doi = ""
-        md = re.search(DOI_RE, body)
-        if md:
-            doi = clean_doi(md.group(0).lower())
+        dois = find_dois(body)
+        doi = dois[0] if dois else ""
         arx = ""
         ma = ARXIV_CITED.search(body)
         if ma:
@@ -530,12 +543,12 @@ def parse_bibitem(text):
 def parse_inline(text):
     """Fallback: pull bare DOIs and arXiv ids out of prose/tex (no title to match)."""
     refs = []
-    for d in sorted({clean_doi(x) for x in re.findall(DOI_RE, text)}):
+    for d in sorted(set(find_dois(text))):
         refs.append(
             {
                 "key": d,
                 "type": "inline-doi",
-                "doi": d.lower(),
+                "doi": d,
                 "arxiv": "",
                 "title": "",
                 "year": "",

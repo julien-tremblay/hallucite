@@ -802,5 +802,43 @@ check("a DOI with a '..' segment is not sent", cls == "UNCHECKABLE" and not reg.
       f"got {cls}: {why}; calls {reg.calls}")
 check("...and it fails the gate like any check that did not run", H.NO_ORACLE in why, why)
 
+# --- round 9: a DOI is read the way people write it ---------------------------------
+
+# 49. Only a `https://doi.org/` prefix was stripped from a doi field; every other common form
+#     went to the registry as written, 404ed, and a real paper was FABRICATED unless its
+#     title was rescued. Found by audit 2026-09-28.
+for form in ["https://doi.org/10.1038/nature14539", "http://dx.doi.org/10.1038/nature14539",
+             "https://dx.doi.org/10.1038/nature14539", "http://doi.org/10.1038/nature14539",
+             "doi:10.1038/nature14539", "DOI: 10.1038/NATURE14539", "  10.1038/nature14539. "]:
+    r = H.parse_bib("@article{a, title={Deep learning}, doi={%s}}" % form)
+    check(f"doi field {form.strip()!r} is read", r and r[0]["doi"] == "10.1038/nature14539",
+          f"got {r and r[0]['doi']!r}")
+r = H.parse_bib("@article{a, title={Deep learning}, doi={http://dx.doi.org/10.1038/nature14539}}")[0]
+cls, why = verify(NATURE, **{k: r[k] for k in ("doi", "title")})
+check("...and such a reference is OK", cls == "OK", f"got {cls}: {why}")
+
+# 50. `_` must be escaped in LaTeX text and Mendeley escapes it in .bib fields, so the TACL
+#     DOI 10.1162/tacl_a_00349 arrived as `tacl\_a\_00349`: sent with its backslashes from
+#     bibtex, cut at the first one inline. Both 404ed.
+TACL = "10.1162/tacl_a_00349"
+for label, got in [
+        ("bibtex \\_", H.parse_bib(r"@article{a, title={X}, doi={10.1162/tacl\_a\_00349}}")),
+        ("bibtex {\\_}", H.parse_bib(r"@article{a, title={X}, doi={10.1162/tacl{\_}a{\_}00349}}")),
+        ("bibtex \\textunderscore", H.parse_bib(r"@article{a, title={X}, doi={10.1162/tacl\textunderscore a\textunderscore 00349}}")),
+        ("\\bibitem", H.parse_bibitem(r"\bibitem{a} A. Rogers, ``A Primer in BERTology,'' TACL, doi:10.1162/tacl\_a\_00349.")),
+        ("inline .tex", H.parse_inline(r"see doi:10.1162/tacl\_a\_00349 for details"))]:
+    check(f"escaped underscores in a DOI ({label})", got and got[0]["doi"] == TACL,
+          f"got {got and got[0]['doi']!r}")
+TACL_REG = Registry(crossref={TACL: "A Primer in BERTology: What We Know About How BERT Works"})
+r = H.parse_bib(r"@article{a, title={A Primer in {BERT}ology: What We Know About How {BERT} Works},"
+                r" doi={10.1162/tacl\_a\_00349}}")[0]
+cls, why = verify(TACL_REG, **{k: r[k] for k in ("doi", "title")})
+check("...and the TACL reference is OK, not FABRICATED", cls == "OK", f"got {cls}: {why}")
+
+# 51. A doi field with no DOI in it does not hide one elsewhere in the entry.
+r = H.parse_bib("@misc{a, title={X}, doi={n/a}, note={https://doi.org/10.1098/rspa.2020.0063}}")
+check("a doi field without a DOI falls back to the entry", r and r[0]["doi"] == "10.1098/rspa.2020.0063",
+      f"got {r and r[0]['doi']!r}")
+
 print(f"\n{'ALL PASS' if not FAILS else str(len(FAILS)) + ' FAILED: ' + ', '.join(FAILS)}")
 sys.exit(0 if not FAILS else 1)

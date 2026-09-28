@@ -119,6 +119,12 @@ MUTANTS = [
      "    if not found.strip():\n        # The empty-title guard below", "    if False:\n        # The empty-title guard below"),
     ("a DOI with a '..' segment is sent",
      "    if _DOT_SEGMENT.search(doi):", "    if False:"),
+    # --- step 5: DOIs are read the way people write them
+    ("LaTeX escapes kept inside DOIs",
+     '    text = _TEX_ESCAPE.sub(lambda m: m.group(1) or "_", text or "")', '    text = text or ""'),
+    ("the doi field taken verbatim",
+     '        dois = find_dois(field("doi", raw_words=True)) or find_dois(body)',
+     '        dois = [clean_doi(field("doi", raw_words=True)).lower()] or find_dois(body)'),
     ("CONTROL: a no-op edit (must survive)",
      "        return \"UNCHECKABLE\", degraded + \" -- refusing", "        pass\n        return \"UNCHECKABLE\", degraded + \" -- refusing"),
 ]
