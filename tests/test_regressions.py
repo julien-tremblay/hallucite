@@ -5,21 +5,104 @@ Every case here is a defect that actually shipped. The live behaviour is covered
 `hallucite.py --selftest`, which does hit Crossref and arXiv.
 """
 import ast
+import contextlib
+import io
+import json
+import os
 import pathlib
 import re
 import subprocess
 import sys
+import tempfile
+import urllib.error
+import urllib.parse
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import hallucite as H  # noqa: E402
 
 FAILS = []
+HAL = str(pathlib.Path(__file__).resolve().parent.parent / "hallucite.py")
 
 
 def check(name, cond, detail=""):
     print(f"  [{'PASS' if cond else 'FAIL'}] {name}" + (f"  {detail}" if not cond else ""))
     if not cond:
         FAILS.append(name)
+
+
+class Registry:
+    """A fake registry standing in for H._get: Crossref works and search, doi.org, arXiv.
+
+    Anything it does not know is a 404, which is what the real registries answer. The
+    earlier tests each patched H._get with a one-off lambda, which is how the MISMATCH
+    branch -- the point of the tool -- went without a single offline test."""
+
+    def __init__(self, crossref=None, search=(), doi_org=None, arxiv=None, arxiv_raw=None):
+        self.crossref = crossref or {}   # doi -> title, or a full Crossref `message` dict
+        self.search = list(search)       # titles a Crossref bibliographic query returns
+        self.doi_org = doi_org or {}     # doi -> CSL-JSON, for DOIs outside Crossref
+        self.arxiv = arxiv or {}         # id -> title
+        self.arxiv_raw = arxiv_raw       # a raw arXiv response body, to simulate outages
+        self.calls = []
+
+    def __call__(self, url, accept="application/json"):
+        self.calls.append(url)
+        missing = urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+        if "api.crossref.org/works?" in url:
+            items = [{"title": [t]} for t in self.search]
+            return json.dumps({"message": {"items": items}}), 200
+        if "api.crossref.org/works/" in url:
+            doi = urllib.parse.unquote(url.split("/works/")[1].split("?")[0])
+            rec = self.crossref.get(doi)
+            if rec is None:
+                raise missing
+            return json.dumps({"message": {"title": [rec]} if isinstance(rec, str) else rec}), 200
+        if url.startswith("https://doi.org/"):
+            doi = urllib.parse.unquote(url[len("https://doi.org/"):])
+            if doi not in self.doi_org:
+                raise missing
+            return json.dumps(self.doi_org[doi]), 200
+        if "export.arxiv.org" in url:
+            if self.arxiv_raw is not None:
+                return self.arxiv_raw, 200
+            aid = url.split("id_list=")[1].split("&")[0]
+            entry = f"<entry><title>{self.arxiv[aid]}</title></entry>" if aid in self.arxiv else ""
+            return f"<feed><title>ArXiv Query</title>{entry}</feed>", 200
+        raise AssertionError(f"unexpected URL {url}")
+
+
+@contextlib.contextmanager
+def registry(reg):
+    real_get, real_sleep = H._get, H.time.sleep
+    H._get, H.time.sleep = reg, (lambda s: None)
+    try:
+        yield reg
+    finally:
+        H._get, H.time.sleep = real_get, real_sleep
+
+
+def verify(reg, **ref):
+    with registry(reg):
+        return H.verify({"doi": "", "arxiv": "", "title": "", "year": "", "key": "k", **ref})
+
+
+def run_main(files, *flags, reg=None):
+    """Run the CLI in-process on {filename: text}; return (exit code, stdout)."""
+    with tempfile.TemporaryDirectory() as d, registry(reg or Registry()):
+        paths = []
+        for name, text in files.items():
+            paths.append(os.path.join(d, name))
+            pathlib.Path(paths[-1]).write_text(text, encoding="utf-8")
+        out, argv = io.StringIO(), sys.argv
+        sys.argv = ["hallucite", *paths, *flags]
+        try:
+            with contextlib.redirect_stdout(out):
+                H.main()
+        except SystemExit as e:
+            return e.code, out.getvalue()
+        finally:
+            sys.argv = argv
+    raise AssertionError("main() returned without exiting")
 
 
 # 1. Trailing punctuation is a prose habit, not part of the DOI. Verified 2026-09-01:
@@ -67,7 +150,16 @@ check("...and that check can still fail",
 
 # 5. A file whose citations live in a sibling file is the normal LaTeX layout. Judging
 #    each input alone made paper.tex a hard PARSER FAILURE next to its own refs.bib.
-check("multi-input pooling is implemented", "any_refs" in src)
+#    This used to assert `"any_refs" in src`, which a mutation pass showed passes with the
+#    pooling deleted, and with a parser failure counted soft. Both are now run.
+TEX = "\\documentclass{article}\\begin{document}\\cite{lecun}\\end{document}\n"
+BIB = "@article{lecun, title={Deep learning}, doi={10.1038/nature14539}}\n"
+NATURE = Registry(crossref={"10.1038/nature14539": "Deep learning"})
+rc, out = run_main({"paper.tex": TEX}, "--gate", reg=NATURE)
+check("citations with zero parsed references fail the gate", rc == 1 and "PARSER FAILURE" in out,
+      f"got exit {rc}")
+rc, out = run_main({"paper.tex": TEX, "refs.bib": BIB}, "--gate", reg=NATURE)
+check("...but not when a sibling input supplies the references", rc == 0, f"got exit {rc}: {out}")
 
 
 # --- 2026-09-02 adversarial pass -------------------------------------------------------
@@ -142,22 +234,33 @@ check("...and it is flagged with the machine-readable sentinel", why.startswith(
 #     as a soft pass, and --gate exited 0 having verified nothing at all -- green because the
 #     oracle was down. A reference with no identifier to check is a different thing and stays
 #     soft. Measured 2026-09-02 with the network blackholed: two fabricated DOIs, exit 0.
-HERE = pathlib.Path(__file__).resolve().parent
-bib = HERE / "_gate_tmp.bib"
-bib.write_text("@article{a,\n  title = {T},\n  doi = {10.9999/nope}\n}\n")
-off = dict(**__import__("os").environ, http_proxy="http://127.0.0.1:9",
-           https_proxy="http://127.0.0.1:9")
-rc = subprocess.run([sys.executable, str(HERE.parent / "hallucite.py"), str(bib), "--gate"],
-                    capture_output=True, env=off).returncode
+#     The network is cut by pointing every proxy variable at a closed port. This used to
+#     build the environment with dict(**os.environ, https_proxy=...), which raises TypeError
+#     on any machine that already exports https_proxy -- every corporate network -- and the
+#     crash left the fixture behind in tests/. no_proxy is dropped so it cannot exempt a host.
+PROXY_VARS = ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY")
+off = {k: v for k, v in os.environ.items() if k.lower() != "no_proxy"}
+off.update({k: "http://127.0.0.1:9" for k in PROXY_VARS})
+with tempfile.TemporaryDirectory() as d:
+    bib = pathlib.Path(d, "gate.bib")
+    bib.write_text("@article{a,\n  title = {T},\n  doi = {10.9999/nope}\n}\n")
+    rc = subprocess.run([sys.executable, HAL, str(bib), "--gate"],
+                        capture_output=True, env=off).returncode
 check("--gate fails closed when no registry answers", rc == 1, f"got exit {rc}")
-bib.unlink()
 
 # 12. A misspelled flag was dropped silently, so --gates ran advisory and exited 0 while the
 #     caller believed they were gating. And an unreadable path raised, exiting 1 -- which
 #     under --gate is indistinguishable from "this bibliography contains fabrications".
-HAL = str(pathlib.Path(__file__).resolve().parent.parent / "hallucite.py")
-check("an unknown flag is rejected, not ignored",
-      subprocess.run([sys.executable, HAL, "x.bib", "--gates"], capture_output=True).returncode == 2)
+#     The flag case used to pass `x.bib`, which does not exist, so it exited 2 for the
+#     missing file and still passed with the flag check deleted. The file is real now, and
+#     the same file without the typo must NOT exit 2.
+with tempfile.TemporaryDirectory() as d:
+    empty = pathlib.Path(d, "empty.bib")
+    empty.write_text("% no entries\n")
+    rc_typo = subprocess.run([sys.executable, HAL, str(empty), "--gates"], capture_output=True).returncode
+    rc_ok = subprocess.run([sys.executable, HAL, str(empty), "--gate"], capture_output=True).returncode
+check("an unknown flag is rejected, not ignored", rc_typo == 2 and rc_ok == 0,
+      f"got {rc_typo} with the typo, {rc_ok} without")
 check("an unreadable path exits 2, not 1",
       subprocess.run([sys.executable, HAL, "/nope/missing.bib", "--gate"],
                      capture_output=True).returncode == 2)
@@ -262,11 +365,24 @@ check("half a check is not a verdict: dead DOI + unreachable title oracle", cls 
 check("...and it fails the gate", H.NO_ORACLE in why, f"got {why}")
 H._get = _real_get
 
-# 19. BAD-DOI is a defect worth fixing, not an accusation: it must not count as hard.
-src2 = (pathlib.Path(__file__).resolve().parent.parent / "hallucite.py").read_text()
-check("BAD-DOI is counted soft, never hard",
-      'elif cls in ("SUSPECT", "UNCHECKABLE", "BAD-DOI")' in src2
-      and '"BAD-DOI"' not in src2.split("if cls in (")[1].split(")")[0])
+# 19. BAD-DOI is a defect worth fixing, not an accusation: it must not count as hard. This
+#     used to grep the source for one spelling of the counting line, so a second line
+#     counting BAD-DOI hard passed it. The gate is run instead. --strict is the documented
+#     way to fail on soft findings, and nothing tested that it does.
+ACM = "@inproceedings{v, title={Attention Is All You Need}, doi={10.5555/3295222.3295349}}\n"
+rescue = Registry(search=["Attention Is All You Need"])
+rc, out = run_main({"acm.bib": ACM}, "--gate", reg=rescue)
+check("BAD-DOI is counted soft, never hard", rc == 0 and "[BDOI]" in out, f"got exit {rc}: {out}")
+rc, _ = run_main({"acm.bib": ACM}, "--strict", "--gate", reg=rescue)
+check("...and --strict turns soft findings into a failing gate", rc == 1, f"got exit {rc}")
+
+# 19b. The rescue bar is what stops a fabricated reference with a plausible title from being
+#      laundered into a warning. Lowering it from 0.90 to 0.60 passed every test, because
+#      the only non-matching fixture scored near zero. A title that merely CONTAINS the
+#      cited one sits at the containment ceiling, 0.85, inside that gap.
+cls, why = verify(Registry(search=["Attention Is All You Need: An Analysis Of The Valuation Of Art"]),
+                  doi="10.5555/3295222.3295349", title="Attention Is All You Need")
+check("a containment-only title match cannot rescue a dead DOI", cls == "FABRICATED", f"got {cls}: {why}")
 
 
 # 20. The identity bar must sit ABOVE the containment ceiling everywhere, or ordered
@@ -316,6 +432,90 @@ cls, why = H.verify({"doi": "10.1155/s1073792801000198", "arxiv": "", "year": ""
                      "title": "Pre-Lie algebras and the rooted trees operad", "key": "c"})
 check("an empty registry title is UNCHECKABLE, not MISMATCH", cls == "UNCHECKABLE", f"got {cls}: {why}")
 H._get = _real_get
+
+
+# --- round 5: audit 2026-09-28. The suite could not fail for most of what it guards ----
+#
+# A mutation pass planted 13 defects in hallucite.py, one at a time, and this suite passed
+# every one of them: the MISMATCH threshold dropped to 0.05, check_arxiv returning OK for
+# any id, the 429 retry deleted, arXiv extraction deleted, among others. The cases below
+# exist so that each of those now goes red. tests/mutants.py re-plants them in CI.
+
+# 23. THE POINT OF THE TOOL, and it had no offline test: a DOI that resolves to a different
+#     paper. Every MISMATCH assertion lived in the live --selftest, which CI never runs.
+cls, why = verify(NATURE, doi="10.1038/nature14539", title="Deep Learning")
+check("a resolving DOI with the cited title is OK", cls == "OK", f"got {cls}: {why}")
+cls, why = verify(NATURE, doi="10.1038/nature14539", title="Attention Is All You Need")
+check("a resolving DOI with a different title is MISMATCH", cls == "MISMATCH", f"got {cls}: {why}")
+
+# 24. Same, for a DOI outside Crossref (DataCite, Zenodo, arXiv DOIs), answered by doi.org.
+ZEN = Registry(doi_org={"10.5281/zenodo.1": {"title": "A Survey of Bird Songs"}})
+cls, why = verify(ZEN, doi="10.5281/zenodo.1", title="A Survey of Bird Songs")
+check("a non-Crossref DOI with the cited title is OK", cls == "OK", f"got {cls}: {why}")
+cls, why = verify(ZEN, doi="10.5281/zenodo.1", title="Attention Is All You Need")
+check("a non-Crossref DOI with a different title is MISMATCH", cls == "MISMATCH", f"got {cls}: {why}")
+
+# 25. arXiv had no offline test at all, so "every arXiv id is OK" passed the suite.
+ARX = Registry(arxiv={"1706.03762": "Attention Is All You Need"})
+cls, why = verify(ARX, arxiv="1706.03762", title="Attention is all you need")
+check("an arXiv id with the cited title is OK", cls == "OK", f"got {cls}: {why}")
+cls, why = verify(ARX, arxiv="1706.03762", title="Deep Residual Learning for Image Recognition")
+check("an arXiv id with a different title is MISMATCH", cls == "MISMATCH", f"got {cls}: {why}")
+cls, why = verify(ARX, arxiv="2101.99999", title="Attention Is All You Need")
+check("an arXiv id with no record is FABRICATED", cls == "FABRICATED", f"got {cls}: {why}")
+
+# 26. arXiv ids in \bibitem entries and in prose. Deleting either extractor passed.
+r = H.parse_bibitem(r"\bibitem{v} A. Vaswani, ``Attention is all you need,'' arXiv:1706.03762, 2017.")
+check("a \\bibitem arXiv id is extracted", r and r[0]["arxiv"] == "1706.03762", f"got {r}")
+r = H.parse_inline("as shown in arXiv:1706.03762v5 and elsewhere")
+check("an inline arXiv id is extracted", [x["arxiv"] for x in r] == ["1706.03762"], f"got {r}")
+
+# 27. 429 and 503 mean "come back later". Deleting the retry passed the suite, and without it
+#     a bibliography big enough to trip the rate limiter fails --gate for a reason that has
+#     nothing to do with its references.
+class _Resp:
+    status = 200
+
+    def read(self):
+        return b"{}"
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def _urlopen_script(*codes):
+    """urlopen that raises HTTPError for each code in turn, then succeeds."""
+    seen = []
+
+    def urlopen(req, timeout=None):
+        seen.append(req.full_url)
+        if len(seen) <= len(codes):
+            raise urllib.error.HTTPError(req.full_url, codes[len(seen) - 1], "x",
+                                         {"Retry-After": "0"}, None)
+        return _Resp()
+    return urlopen, seen
+
+
+real_urlopen, real_sleep = H.urllib.request.urlopen, H.time.sleep
+H.time.sleep = lambda s: None
+try:
+    H.urllib.request.urlopen, seen = _urlopen_script(429, 503)
+    body, status = H._get("https://api.crossref.org/works/10.1/x")
+    check("429 and 503 are retried", status == 200 and len(seen) == 3, f"{len(seen)} attempts")
+    H.urllib.request.urlopen, seen = _urlopen_script(404)
+    try:
+        H._get("https://api.crossref.org/works/10.1/x")
+        check("a 404 is not retried", False, "no exception raised")
+    except urllib.error.HTTPError as e:
+        check("a 404 is not retried", e.code == 404 and len(seen) == 1, f"{len(seen)} attempts")
+finally:
+    H.urllib.request.urlopen, H.time.sleep = real_urlopen, real_sleep
+
+# 28. The parser fixtures built into hallucite.py only ran under the live --selftest.
+check("the built-in parser fixtures pass offline", H.selftest_parsers())
 
 print(f"\n{'ALL PASS' if not FAILS else str(len(FAILS)) + ' FAILED: ' + ', '.join(FAILS)}")
 sys.exit(0 if not FAILS else 1)

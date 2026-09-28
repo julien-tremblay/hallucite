@@ -17,6 +17,9 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - run: python3 tests/test_regressions.py
+      - name: every planted defect turns the suite red
+        if: matrix.python == '3.12'
+        run: python3 tests/mutants.py
       - name: hallucite.py is a single stdlib-only file
         if: matrix.python == '3.12'   # sys.stdlib_module_names is 3.10+
         run: |
