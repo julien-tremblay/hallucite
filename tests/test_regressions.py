@@ -840,5 +840,48 @@ r = H.parse_bib("@misc{a, title={X}, doi={n/a}, note={https://doi.org/10.1098/rs
 check("a doi field without a DOI falls back to the entry", r and r[0]["doi"] == "10.1098/rspa.2020.0063",
       f"got {r and r[0]['doi']!r}")
 
+# --- round 10: what a file cites, and what "OK" means -----------------------------------
+
+# 52. The citation-marker check knew `\cite{`, `\bibitem`, `@article` and `@inproceedings`.
+#     A natbib paper run without its .bib printed "no citation markers" and PASSED --gate,
+#     where a hard parser failure is promised. Found by audit 2026-09-28.
+for cmd in [r"\citep{a}", r"\citet{a}", r"\cite[p.~3]{a}", r"\parencite{a}", r"\autocite{a}",
+            r"\textcite{a}", r"\footcite[see][12]{a}", r"\citeauthor*{a}", r"\bibliography{refs}"]:
+    rc, out = run_main({"paper.tex": "\\begin{document}As shown " + cmd + ".\\end{document}\n"}, "--gate")
+    check(f"{cmd} is a citation: alone, it fails the gate", rc == 1 and "PARSER FAILURE" in out,
+          f"got exit {rc}: {out.strip()[:80]}")
+rc, out = run_main({"notes.md": "Write to me@example.com (any time). Twitter: @someone(ish).\n"}, "--gate")
+check("...while prose with an @ is not a bibliography", rc == 0, f"got exit {rc}: {out}")
+
+# 53. One parser per file dropped every reference the chosen parser could not see: a
+#     markdown page quoting one BibTeX entry was parsed as BibTeX only. And the BibTeX
+#     trigger was case-sensitive, so `@ARTICLE` in a file not named .bib was read as prose.
+MD = ("# Related work\nDeep nets (https://doi.org/10.1038/nature14539) and a made-up one\n"
+      "(https://doi.org/10.9999/fake.123). Cite this repo as:\n\n"
+      "@ARTICLE{us, title={Our Tool}, doi={10.5555/ours}}\n")
+got = sorted(r["doi"] for r in H.parse_file("notes.md", MD))
+check("a file mixing BibTeX and prose loses neither",
+      got == ["10.1038/nature14539", "10.5555/ours", "10.9999/fake.123"], f"got {got}")
+# The inline pass would find the entry's DOI either way; only a BibTeX read keeps its title,
+# and without a title a DOI pointing at the wrong paper passes.
+got = [(r["key"], r["title"]) for r in H.parse_file("notes.md", MD) if r["doi"] == "10.5555/ours"]
+check("...and @ARTICLE is read as BibTeX, title and all", got == [("us", "Our Tool")], f"got {got}")
+TEX_MIXED = (PLAINNAT.replace(r"\end{thebibliography}", "") +
+             "\n\\end{thebibliography}\nData: https://doi.org/10.5281/zenodo.1 and doi:10.1038/nature14539\n")
+got = [(r["type"], r["doi"]) for r in H.parse_file("paper.tex", TEX_MIXED)]
+check("\\bibitem entries plus identifiers they do not already cover, without duplicates",
+      got.count(("bibitem", "10.1038/nature14539")) == 1 and ("inline-doi", "10.5281/zenodo.1") in got
+      and ("inline-doi", "10.1038/nature14539") not in got, f"got {got}")
+
+# 54. With no cited title, "OK" means the identifier exists, not that it is the paper cited:
+#     a DOI pointing at a different paper passes. Markdown and bare .tex give nothing else.
+#     It is said on the line and in the summary now.
+rc, out = run_main({"paper.md": "Attention is all you need. https://doi.org/10.1038/nature14539\n"},
+                   reg=NATURE)
+check("an identifier-only pass says so", "[identifier only" in out and "passed on the identifier alone" in out,
+      f"got {out}")
+rc, out = run_main({"r.bib": BIB}, reg=NATURE)
+check("...and a titled pass does not", "identifier" not in out, f"got {out}")
+
 print(f"\n{'ALL PASS' if not FAILS else str(len(FAILS)) + ' FAILED: ' + ', '.join(FAILS)}")
 sys.exit(0 if not FAILS else 1)

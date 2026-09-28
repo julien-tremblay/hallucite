@@ -6,10 +6,10 @@ Language models invent references. They invent plausible authors, plausible titl
 DOIs with the right shape that point at nothing, or at a different paper entirely. The
 second kind is worse, because it survives a careful read.
 
-`hallucite` resolves every reference in a `.bib`, `.tex`, or `.md` file against the
-authoritative registries (Crossref and doi.org for DOIs, arXiv for eprints, Crossref and
-arXiv for titles) and tells you
-which ones do not exist.
+`hallucite` resolves every reference in a `.bib`, `.bbl`, `.tex`, or `.md` file against
+the authoritative registries (Crossref and doi.org for DOIs, arXiv for eprints, Crossref and
+arXiv for titles) and tells you which ones do not exist. A file may mix forms: BibTeX
+entries, `\bibitem` entries and bare identifiers are all read.
 
 ```
 $ hallucite paper.bib
@@ -148,8 +148,10 @@ unambiguously (a `title` field, ``` ``quoted'' ```, `\bibinfo{title}`, the first
 of a `.bbl`) still can. Before this, the `.bbl` BibTeX writes for natbib users had its
 `\emph{}` venue read as the title, and every reference carrying a DOI came back `MISMATCH`.
 
-**A parser failure is not a clean bill of health.** If a file plainly contains citations and
-zero are parsed, that is reported as a hard failure rather than "0 fabricated." Silent
+**A parser failure is not a clean bill of health.** If a file plainly contains citations
+(`\cite` and every natbib or biblatex variant, `\bibliography`, `\bibitem`, a BibTeX entry)
+and zero references are parsed from any input, that is reported as a hard failure rather
+than "0 fabricated." Silent
 degradation into a reassuring green is the specific failure this tool exists to prevent.
 
 **Deterministic beats a model here.** The HALLMARK study found a deterministic DOI/bibtex
@@ -161,6 +163,11 @@ program, so there is nothing to hallucinate.
 
 - Books, theses, standards, and non-indexed venues often have no DOI and land in `SUSPECT`
   or `UNCHECKABLE`. That is a prompt to look, not a verdict.
+- **In Markdown, and in `.tex` outside a bibliography, only identifiers are read**: DOIs,
+  `arXiv:` ids and arxiv.org links. With no title to compare, `OK` means the identifier
+  exists, not that it is the paper you meant, so a DOI pointing at a different paper passes.
+  Every such line is marked `[identifier only]` and the summary counts them. Put your
+  references in BibTeX or `\bibitem` form to get the title check.
 - **Titles shorter than two characters, and `\bibitem` entries whose title is not quoted,
   tagged with `\bibinfo{title}`, set off by `\newblock` or emphasised, parse without a
   title.** The DOI is still checked; the title comparison simply does not run, and the

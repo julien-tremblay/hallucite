@@ -1092,6 +1092,43 @@ def selftest():
 KNOWN_FLAGS = {"--strict", "--gate", "--selftest"}
 
 
+# BibTeX and biblatex entry types. A known list rather than `@\w+`, so that a markdown file
+# mentioning `@someone(` is not mistaken for a bibliography.
+_ENTRY_TYPES = ("article", "book", "booklet", "conference", "inbook", "incollection",
+                "inproceedings", "manual", "mastersthesis", "misc", "phdthesis", "proceedings",
+                "techreport", "unpublished", "online", "report", "thesis", "dataset",
+                "software", "collection", "patent", "electronic", "www", "mvbook",
+                "reference", "periodical", "standard")
+_BIB_ENTRY = re.compile(r"@(?:" + "|".join(_ENTRY_TYPES) + r")\s*[{(]", re.I)
+# Evidence that a file cites something. It was `\cite{`, `\bibitem`, `@article` and
+# `@inproceedings`, so natbib's \citep and \citet -- the commonest commands there are --
+# biblatex's \parencite, \autocite and \textcite, `\cite[p.~3]{}`, `@Article` and `@book`
+# were all invisible. A natbib paper run without its .bib printed "no citation markers" and
+# PASSED --gate, where the README promises a hard parser failure. Audit 2026-09-28.
+_CITE_MARKER = re.compile(
+    r"\\[A-Za-z]*cite[A-Za-z]*\*?\s*(?:\[[^\]]*\]\s*){0,2}\{"
+    r"|\\bibitem\b|\\bibliography\s*\{|\\addbibresource\s*\{|\\printbibliography\b"
+    r"|" + _BIB_ENTRY.pattern, re.I)
+
+
+def parse_file(path, text):
+    r"""Every reference in one file.
+
+    A .bib is BibTeX. Anything else may mix forms, and each is read: BibTeX entries, then
+    \bibitem entries, then any DOI or arXiv id not already accounted for. Choosing ONE parser
+    per file used to drop the rest silently: a markdown page quoting a single BibTeX entry
+    was parsed as BibTeX only, and every other reference on it vanished from the count.
+    """
+    if path.lower().endswith(".bib"):
+        return parse_bib(text)
+    refs = parse_bib(text) if _BIB_ENTRY.search(text) else []
+    if r"\bibitem" in text:
+        refs += parse_bibitem(text)
+    seen = {r["doi"] for r in refs} | {r["arxiv"] for r in refs}
+    refs += [r for r in parse_inline(text) if (r["doi"] or r["arxiv"]) not in seen]
+    return refs
+
+
 def main():
     # A misspelled flag used to be dropped silently, so `--gates` ran advisory and exited 0
     # while the caller believed they were gating. A gate you think you enabled and did not
@@ -1114,7 +1151,7 @@ def main():
             "\nusage: hallucite <file.bib|.tex|.md> [...] [--strict] [--gate] [--selftest]"
         )
         sys.exit(2)
-    hard, soft, degraded = 0, 0, 0
+    hard, soft, degraded, bare = 0, 0, 0, 0
     # Parse every input BEFORE judging any of it: a .tex citing into a sibling .bib is the
     # standard LaTeX layout, and judging the .tex alone reported a hard parser failure for
     # a perfectly normal paper.
@@ -1127,13 +1164,7 @@ def main():
         except OSError as e:
             print(f"cannot read {path}: {e.strerror}", file=sys.stderr)
             sys.exit(2)
-        if path.endswith(".bib") or "@article" in text or "@inproceedings" in text:
-            refs = parse_bib(text)
-        elif r"\bibitem" in text:
-            refs = parse_bibitem(text) or parse_inline(text)
-        else:
-            refs = parse_inline(text)
-        parsed.append((path, text, refs))
+        parsed.append((path, text, parse_file(path, text)))
     any_refs = any(refs for _, _, refs in parsed)
 
     for path, text, refs in parsed:
@@ -1141,9 +1172,7 @@ def main():
             # A file that clearly HAS references but yielded none is a parser
             # failure, not a clean bill of health. Reporting "0 fabricated"
             # there is the exact silent-degradation this tool exists to prevent.
-            has_markers = bool(
-                re.search(r"\\cite\{|\\bibitem|@article|@inproceedings", text)
-            )
+            has_markers = bool(_CITE_MARKER.search(text))
             if has_markers and not any_refs:
                 print(f"\n== {path} ==")
                 print(
@@ -1159,6 +1188,13 @@ def main():
         print(f"\n== {path} ({len(refs)} refs) ==")
         for ref in refs:
             cls, why = verify(ref)
+            if cls == "OK" and not norm(ref["title"]):
+                # Markdown and bare .tex give identifiers without titles, and so does a
+                # bibtex entry with no title field. "OK" there means the identifier EXISTS,
+                # not that it is the paper cited: a DOI pointing at a different paper, the
+                # failure this tool calls the worse kind, passes. It said so nowhere.
+                bare += 1
+                why += "  [identifier only: no cited title to compare]"
             if cls in ("FABRICATED", "MISMATCH"):
                 hard += 1
             elif cls in ("SUSPECT", "UNCHECKABLE", "BAD-DOI"):
@@ -1179,6 +1215,9 @@ def main():
         f"\nsummary: {hard} hard (fabricated/mismatch), {soft} soft (suspect/uncheckable)"
         + (f", {degraded} UNVERIFIED (the check could not run)" if degraded else "")
     )
+    if bare:
+        print(f"note: {bare} reference(s) passed on the identifier alone. With no cited title to\n"
+              "      compare, a DOI that points at a different paper would pass too.")
     if degraded:
         print(
             f"WARNING: {degraded} reference(s) could not be checked; the reason is on each line.\n"

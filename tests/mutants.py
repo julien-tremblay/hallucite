@@ -125,6 +125,17 @@ MUTANTS = [
     ("the doi field taken verbatim",
      '        dois = find_dois(field("doi", raw_words=True)) or find_dois(body)',
      '        dois = [clean_doi(field("doi", raw_words=True)).lower()] or find_dois(body)'),
+    # --- step 6: citation markers, dispatch, identifier-only passes
+    ("natbib and biblatex cite commands not recognised",
+     r'    r"\\[A-Za-z]*cite[A-Za-z]*\*?\s*(?:\[[^\]]*\]\s*){0,2}\{"', r'    r"\\cite\{"'),
+    ("one parser per file",
+     '    refs += [r for r in parse_inline(text) if (r["doi"] or r["arxiv"]) not in seen]',
+     "    pass"),
+    ("BibTeX entry types matched case-sensitively",
+     '_BIB_ENTRY = re.compile(r"@(?:" + "|".join(_ENTRY_TYPES) + r")\\s*[{(]", re.I)',
+     '_BIB_ENTRY = re.compile(r"@(?:" + "|".join(_ENTRY_TYPES) + r")\\s*[{(]")'),
+    ("an identifier-only pass not labelled",
+     '                why += "  [identifier only: no cited title to compare]"', "                pass"),
     ("CONTROL: a no-op edit (must survive)",
      "        return \"UNCHECKABLE\", degraded + \" -- refusing", "        pass\n        return \"UNCHECKABLE\", degraded + \" -- refusing"),
 ]
