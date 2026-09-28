@@ -1,6 +1,10 @@
 name: tests
 on: [push, pull_request]
 
+# The suite reads the checkout and nothing else; the token needs no more than that.
+permissions:
+  contents: read
+
 jobs:
   offline:
     # Only the OFFLINE suite runs here. `hallucite.py --selftest` and `bench/` both hit

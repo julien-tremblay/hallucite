@@ -12,15 +12,15 @@ arXiv for titles) and tells you which ones do not exist. A file may mix forms: B
 entries, `\bibitem` entries and bare identifiers are all read.
 
 ```
-$ hallucite paper.bib
+$ python3 hallucite.py paper.bib
 
-== paper.bib (42 refs) ==
-  [ ok ] devlin2019bert     DOI resolves, title match 0.99
-  [FABR] chen2007fiber      DOI 10.1109/JLT.2007.899999 does not resolve at doi.org
-  [MISM] wuttke2003noise    DOI resolves to a DIFFERENT title (match 0.21)
-  [BDOI] vaswani2017        paper is real, DOI 10.5555/3295222.3295349 resolves nowhere
-  [SUSP] smith2019book      no close Crossref match for title
-  [??? ] internal2024       no DOI, arXiv id, or usable title
+== paper.bib (6 refs) ==
+  [ ok ] devlin2019bert                           DOI resolves, title match 1.00
+  [FABR] chen2007fiber                            DOI 10.1109/jlt.2007.899999 is not registered with any agency (doi.org), and no Crossref or arXiv record matches the title (best 0.77)
+  [MISM] wuttke2003noise                          DOI resolves to a DIFFERENT title (match 0.42): got 'Continuous Variable Quantum Cryptography Using Coherent Stat'
+  [BDOI] vaswani2017                              the paper is real (Crossref match 1.00: 'Attention Is All You Need') but DOI 10.5555/3295222.3295349 resolves nowhere: wrong, retired or never-registered identifier
+  [SUSP] smith2019book                            no close Crossref match (best 0.68) - verify by hand (book/thesis/non-indexed?)
+  [??? ] internal2024                             no DOI, arXiv id, or title to verify
 
 summary: 2 hard (fabricated/mismatch), 3 soft (suspect/uncheckable)
 ```
@@ -42,9 +42,10 @@ faster and more reliable. It works without it.
 ## Use it as a gate
 
 ```
-hallucite --gate paper.bib      # exit 1 if anything is FABRICATED or MISMATCH,
-                                # or if a registry could not be reached
-hallucite --strict --gate *.bib # also fail on SUSPECT and on unidentifiable refs
+python3 hallucite.py --gate paper.bib        # exit 1 if anything is FABRICATED or MISMATCH,
+                                             # or if a check could not run
+python3 hallucite.py --strict --gate *.bib   # also fail on every soft finding:
+                                             # SUSPECT, BAD-DOI and UNCHECKABLE
 ```
 
 Without `--gate` the tool is advisory and always exits 0; read the summary line. Exit 2
@@ -243,11 +244,14 @@ about the design is as welcome as a bug; see [`CONTRIBUTING.md`](CONTRIBUTING.md
 
 ```
 python3 tests/test_regressions.py   # offline, no network, ~1s. This is what CI runs.
-python3 hallucite.py --selftest     # live, hits Crossref and arXiv, ~10s
+python3 tests/mutants.py            # offline, ~30s: plants known defects, requires red
+python3 hallucite.py --selftest     # live, hits Crossref, doi.org and arXiv, ~30s
 ```
 
 Every case in the offline suite is a defect that actually shipped. It runs on every push, on
-Python 3.9 and 3.12. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the false-positive
+Python 3.9 and 3.12, and `tests/mutants.py` proves it can fail: it re-plants each of those
+defects in turn and requires the suite to go red. What changed and why is in
+[`CHANGELOG.md`](CHANGELOG.md). See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the false-positive
 measurement and what a useful patch looks like.
 
 ## License

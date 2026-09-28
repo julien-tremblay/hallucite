@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """hallucite: find fabricated and mismatched citations. Deterministic, no LLM, no API key.
 
-Motivation (2026-07-11 research digest): the HALLMARK study found a deterministic bibtex/DOI
-verifier (F1 0.908) BEATS the best zero-shot LLM (0.840) at catching fabricated citations, and
-giving the LLM tool access made it WORSE.
-So this is a $0, no-LLM, network-only check that resolves every reference against the authoritative
-registries (Crossref for DOIs/titles, arXiv for eprints) and classifies it.
+Motivation: the HALLMARK study found a deterministic bibtex/DOI verifier (F1 0.908) BEATS the
+best zero-shot LLM (0.840) at catching fabricated citations, and giving the LLM tool access
+made it WORSE. So this is a $0, no-LLM, network-only check that resolves every reference
+against the authoritative registries (Crossref and doi.org for DOIs, arXiv for eprints,
+Crossref and arXiv for titles) and classifies it.
 
 Classes (most→least dangerous):
   FABRICATED  identifier resolves nowhere AND no record matches the title -> hard
@@ -14,12 +14,13 @@ Classes (most→least dangerous):
   SUSPECT     title-only ref with no close Crossref match           -> soft (may be a book/thesis/non-indexed venue)
               or a resolving id disagreeing with a GUESSED title   -> soft (a guess is not evidence)
   OK          resolved and title matches                            -> pass
-  UNCHECKABLE no DOI / arXiv / usable title, or registry unreachable-> soft; unreachable also fails --gate
+  UNCHECKABLE no DOI / arXiv / usable title, or the check could not run -> soft; the latter fails --gate
 
 Exit codes. Without --gate the tool is advisory and always exits 0 (2 on a usage error);
-read the summary line. With --gate it exits 1 on any hard finding, and also when a registry
-could not be reached, because a check that did not run must not report a pass. --strict
-additionally fails on SUSPECT and on references carrying no identifier.
+read the summary line. With --gate it exits 1 on any hard finding, and also when a check
+could not run (a registry unreachable, a request unsafe to send, an internal error), because
+a check that did not run must not report a pass. --strict additionally fails on every soft
+finding: SUSPECT, BAD-DOI and UNCHECKABLE.
 
 What it does NOT catch: a citation whose title is close but wrong. Title comparison is
 lexical, so "Attention Is Not All You Need" scores 0.93 against "Attention Is All You Need"
@@ -27,7 +28,7 @@ and passes, as does Recognition -> Segmentation. It catches invented and swapped
 references, not subtly altered ones. Authors, venue and year are parsed but never
 compared.
 
-Usage:  hallucite <file.bib | file.tex | file.md> [...]   (--strict makes SUSPECT fail too)
+Usage:  hallucite <file.bib | file.bbl | file.tex | file.md> [...]   (--strict fails soft findings too)
 Grounding lives in the REGISTRY, never the language. Advisory by default; wire into a commit hook with --gate.
 """
 
