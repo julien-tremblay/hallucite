@@ -23,6 +23,7 @@ Neither needs a fix attached.
 
 ```
 python3 tests/test_regressions.py   # offline, no network, ~1s. This is what CI runs.
+python3 tests/mutants.py            # offline, ~20s: plants known defects, requires red
 python3 hallucite.py --selftest     # live, hits Crossref and arXiv, ~10s
 ```
 
@@ -31,13 +32,14 @@ The false-positive measurement, about ten minutes and no API key:
 ```
 python3 bench/sample.py manifest.json
 python3 bench/build.py manifest.json .
-python3 hallucite.py raw.bib
-python3 hallucite.py perturbed.bib
+python3 hallucite.py raw.bib perturbed.bib deformed.bib raw.bbl   # want zero hard findings
+python3 hallucite.py rescue.bib       # want BAD-DOI on every line
 python3 hallucite.py control.bib      # must produce hard findings, or the run is vacuous
 ```
 
-If your sample gives a non-zero false-positive rate where the README claims zero, that is a
-finding and I want to see it. Include `manifest.json` so it can be reproduced.
+If your sample gives a non-zero false-positive rate, that is a finding and I want to see it.
+Include `manifest.json` so it can be reproduced. A run of the current tool has not been
+published yet, so a clean one is worth sending too.
 
 ## If you send a patch
 
@@ -47,6 +49,12 @@ that could not have caught them, including a "no French in user-visible strings"
 grepped for the four words a previous fix had already removed while seven others sat in the
 output. `tests/test_regressions.py` is a plain script, no framework, and every case in it
 carries a comment naming the defect it locks down. Match that.
+
+Then prove it: add your defect to `MUTANTS` in `tests/mutants.py`. That script re-plants each
+defect in a copy of `hallucite.py` and fails unless the suite goes red, and CI runs it. It
+exists because an audit on 2026-09-28 planted 13 defects and the suite passed all 13; three of
+its checks were grepping the source or passing for an unrelated reason. Never test a property
+by searching the source for the line that implements it. Run the behaviour.
 
 Comments are held to one rule: a comment earns its line if deleting it would let someone
 reintroduce a bug or take a wrong turn the code cannot warn them about. That is why some

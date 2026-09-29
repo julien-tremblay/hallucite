@@ -5,21 +5,132 @@ Every case here is a defect that actually shipped. The live behaviour is covered
 `hallucite.py --selftest`, which does hit Crossref and arXiv.
 """
 import ast
+import contextlib
+import io
+import json
+import os
 import pathlib
 import re
 import subprocess
 import sys
+import tempfile
+import urllib.error
+import urllib.parse
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import hallucite as H  # noqa: E402
 
 FAILS = []
+HAL = str(pathlib.Path(__file__).resolve().parent.parent / "hallucite.py")
+# Nothing in this process talks to a real registry, so nothing should wait for one. The
+# arXiv client spaces requests three seconds apart, as arXiv asks, and without this every
+# in-process arXiv lookup made the suite sleep for real. Tests that time things patch it.
+H.time.sleep = lambda s: None
 
 
 def check(name, cond, detail=""):
     print(f"  [{'PASS' if cond else 'FAIL'}] {name}" + (f"  {detail}" if not cond else ""))
     if not cond:
         FAILS.append(name)
+
+
+class Registry:
+    """A fake registry standing in for H._get: Crossref works and search, doi.org, arXiv.
+
+    Anything it does not know is a 404, which is what the real registries answer. The
+    earlier tests each patched H._get with a one-off lambda, which is how the MISMATCH
+    branch -- the point of the tool -- went without a single offline test."""
+
+    def __init__(self, crossref=None, search=(), doi_org=None, arxiv=None, arxiv_raw=None,
+                 arxiv_search=(), landing=None, handle_raw=None):
+        self.crossref = crossref or {}   # doi -> title, or a full Crossref `message` dict
+        self.search = list(search)       # titles (or full records) a Crossref query returns
+        self.doi_org = doi_org or {}     # doi -> CSL-JSON, for DOIs outside Crossref
+        # doi -> what content negotiation meets for a DOI that is registered but whose
+        # agency has no metadata service: an HTTP code, or a 200 body (a landing page).
+        self.landing = landing or {}
+        self.handle_raw = handle_raw     # (status, body) from the Handle API, to simulate faults
+        self.arxiv = arxiv or {}         # id -> title
+        self.arxiv_raw = arxiv_raw       # a raw arXiv response body, to simulate outages
+        self.arxiv_search = list(arxiv_search)  # titles an arXiv title search returns
+        self.calls = []
+
+    def __call__(self, url, accept="application/json"):
+        self.calls.append(url)
+        missing = urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+        if "api.crossref.org/works?" in url:
+            items = [t if isinstance(t, dict) else {"title": [t]} for t in self.search]
+            return json.dumps({"message": {"items": items}}), 200
+        if "api.crossref.org/works/" in url:
+            doi = urllib.parse.unquote(url.split("/works/")[1].split("?")[0])
+            rec = self.crossref.get(doi)
+            if rec is None:
+                raise missing
+            return json.dumps({"message": {"title": [rec]} if isinstance(rec, str) else rec}), 200
+        if url.startswith("https://doi.org/api/handles/"):
+            if self.handle_raw:
+                st, body = self.handle_raw
+                if st != 200:
+                    raise urllib.error.HTTPError(url, st, "x", {}, None)
+                return body, 200
+            doi = urllib.parse.unquote(url[len("https://doi.org/api/handles/"):])
+            if doi in self.doi_org or doi in self.landing:
+                return json.dumps({"responseCode": 1, "handle": doi}), 200
+            raise missing  # the Handle API answers 404 with responseCode 100
+        if url.startswith("https://doi.org/"):
+            doi = urllib.parse.unquote(url[len("https://doi.org/"):])
+            if doi in self.landing:
+                page = self.landing[doi]
+                if isinstance(page, int):
+                    raise urllib.error.HTTPError(url, page, "x", {}, None)
+                return page, 200
+            if doi not in self.doi_org:
+                raise missing
+            return json.dumps(self.doi_org[doi]), 200
+        if "export.arxiv.org" in url:
+            if self.arxiv_raw is not None:
+                return self.arxiv_raw, 200
+            if "search_query=" in url:
+                entries = "".join(f"<entry><title>{t}</title></entry>" for t in self.arxiv_search)
+                return f"<feed><title>ArXiv Query</title>{entries}</feed>", 200
+            aid = urllib.parse.unquote(url.split("id_list=")[1].split("&")[0])
+            entry = f"<entry><title>{self.arxiv[aid]}</title></entry>" if aid in self.arxiv else ""
+            return f"<feed><title>ArXiv Query</title>{entry}</feed>", 200
+        raise AssertionError(f"unexpected URL {url}")
+
+
+@contextlib.contextmanager
+def registry(reg):
+    real_get, real_sleep = H._get, H.time.sleep
+    H._get, H.time.sleep = reg, (lambda s: None)
+    try:
+        yield reg
+    finally:
+        H._get, H.time.sleep = real_get, real_sleep
+
+
+def verify(reg, **ref):
+    with registry(reg):
+        return H.verify({"doi": "", "arxiv": "", "title": "", "year": "", "key": "k", **ref})
+
+
+def run_main(files, *flags, reg=None):
+    """Run the CLI in-process on {filename: text}; return (exit code, stdout)."""
+    with tempfile.TemporaryDirectory() as d, registry(reg or Registry()):
+        paths = []
+        for name, text in files.items():
+            paths.append(os.path.join(d, name))
+            pathlib.Path(paths[-1]).write_text(text, encoding="utf-8")
+        out, argv = io.StringIO(), sys.argv
+        sys.argv = ["hallucite", *paths, *flags]
+        try:
+            with contextlib.redirect_stdout(out):
+                H.main()
+        except SystemExit as e:
+            return e.code, out.getvalue()
+        finally:
+            sys.argv = argv
+    raise AssertionError("main() returned without exiting")
 
 
 # 1. Trailing punctuation is a prose habit, not part of the DOI. Verified 2026-09-01:
@@ -67,7 +178,16 @@ check("...and that check can still fail",
 
 # 5. A file whose citations live in a sibling file is the normal LaTeX layout. Judging
 #    each input alone made paper.tex a hard PARSER FAILURE next to its own refs.bib.
-check("multi-input pooling is implemented", "any_refs" in src)
+#    This used to assert `"any_refs" in src`, which a mutation pass showed passes with the
+#    pooling deleted, and with a parser failure counted soft. Both are now run.
+TEX = "\\documentclass{article}\\begin{document}\\cite{lecun}\\end{document}\n"
+BIB = "@article{lecun, title={Deep learning}, doi={10.1038/nature14539}}\n"
+NATURE = Registry(crossref={"10.1038/nature14539": "Deep learning"})
+rc, out = run_main({"paper.tex": TEX}, "--gate", reg=NATURE)
+check("citations with zero parsed references fail the gate", rc == 1 and "PARSER FAILURE" in out,
+      f"got exit {rc}")
+rc, out = run_main({"paper.tex": TEX, "refs.bib": BIB}, "--gate", reg=NATURE)
+check("...but not when a sibling input supplies the references", rc == 0, f"got exit {rc}: {out}")
 
 
 # --- 2026-09-02 adversarial pass -------------------------------------------------------
@@ -142,22 +262,33 @@ check("...and it is flagged with the machine-readable sentinel", why.startswith(
 #     as a soft pass, and --gate exited 0 having verified nothing at all -- green because the
 #     oracle was down. A reference with no identifier to check is a different thing and stays
 #     soft. Measured 2026-09-02 with the network blackholed: two fabricated DOIs, exit 0.
-HERE = pathlib.Path(__file__).resolve().parent
-bib = HERE / "_gate_tmp.bib"
-bib.write_text("@article{a,\n  title = {T},\n  doi = {10.9999/nope}\n}\n")
-off = dict(**__import__("os").environ, http_proxy="http://127.0.0.1:9",
-           https_proxy="http://127.0.0.1:9")
-rc = subprocess.run([sys.executable, str(HERE.parent / "hallucite.py"), str(bib), "--gate"],
-                    capture_output=True, env=off).returncode
+#     The network is cut by pointing every proxy variable at a closed port. This used to
+#     build the environment with dict(**os.environ, https_proxy=...), which raises TypeError
+#     on any machine that already exports https_proxy -- every corporate network -- and the
+#     crash left the fixture behind in tests/. no_proxy is dropped so it cannot exempt a host.
+PROXY_VARS = ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY")
+off = {k: v for k, v in os.environ.items() if k.lower() != "no_proxy"}
+off.update({k: "http://127.0.0.1:9" for k in PROXY_VARS})
+with tempfile.TemporaryDirectory() as d:
+    bib = pathlib.Path(d, "gate.bib")
+    bib.write_text("@article{a,\n  title = {T},\n  doi = {10.9999/nope}\n}\n")
+    rc = subprocess.run([sys.executable, HAL, str(bib), "--gate"],
+                        capture_output=True, env=off).returncode
 check("--gate fails closed when no registry answers", rc == 1, f"got exit {rc}")
-bib.unlink()
 
 # 12. A misspelled flag was dropped silently, so --gates ran advisory and exited 0 while the
 #     caller believed they were gating. And an unreadable path raised, exiting 1 -- which
 #     under --gate is indistinguishable from "this bibliography contains fabrications".
-HAL = str(pathlib.Path(__file__).resolve().parent.parent / "hallucite.py")
-check("an unknown flag is rejected, not ignored",
-      subprocess.run([sys.executable, HAL, "x.bib", "--gates"], capture_output=True).returncode == 2)
+#     The flag case used to pass `x.bib`, which does not exist, so it exited 2 for the
+#     missing file and still passed with the flag check deleted. The file is real now, and
+#     the same file without the typo must NOT exit 2.
+with tempfile.TemporaryDirectory() as d:
+    empty = pathlib.Path(d, "empty.bib")
+    empty.write_text("% no entries\n")
+    rc_typo = subprocess.run([sys.executable, HAL, str(empty), "--gates"], capture_output=True).returncode
+    rc_ok = subprocess.run([sys.executable, HAL, str(empty), "--gate"], capture_output=True).returncode
+check("an unknown flag is rejected, not ignored", rc_typo == 2 and rc_ok == 0,
+      f"got {rc_typo} with the typo, {rc_ok} without")
 check("an unreadable path exits 2, not 1",
       subprocess.run([sys.executable, HAL, "/nope/missing.bib", "--gate"],
                      capture_output=True).returncode == 2)
@@ -242,6 +373,8 @@ def _mock(doi_404=True, best_title=None, title_oracle_ok=True):
                 raise urllib_error.HTTPError(url, 503, "down", {}, None)
             items = [{"title": [best_title]}] if best_title else []
             return _j2.dumps({"message": {"items": items}}), 200
+        if "export.arxiv.org" in url:
+            return "<feed><title>ArXiv Query</title></feed>", 200
         raise urllib_error.HTTPError(url, 404, "Not Found", {}, None)
     return g
 
@@ -262,11 +395,24 @@ check("half a check is not a verdict: dead DOI + unreachable title oracle", cls 
 check("...and it fails the gate", H.NO_ORACLE in why, f"got {why}")
 H._get = _real_get
 
-# 19. BAD-DOI is a defect worth fixing, not an accusation: it must not count as hard.
-src2 = (pathlib.Path(__file__).resolve().parent.parent / "hallucite.py").read_text()
-check("BAD-DOI is counted soft, never hard",
-      'elif cls in ("SUSPECT", "UNCHECKABLE", "BAD-DOI")' in src2
-      and '"BAD-DOI"' not in src2.split("if cls in (")[1].split(")")[0])
+# 19. BAD-DOI is a defect worth fixing, not an accusation: it must not count as hard. This
+#     used to grep the source for one spelling of the counting line, so a second line
+#     counting BAD-DOI hard passed it. The gate is run instead. --strict is the documented
+#     way to fail on soft findings, and nothing tested that it does.
+ACM = "@inproceedings{v, title={Attention Is All You Need}, doi={10.5555/3295222.3295349}}\n"
+rescue = Registry(search=["Attention Is All You Need"])
+rc, out = run_main({"acm.bib": ACM}, "--gate", reg=rescue)
+check("BAD-DOI is counted soft, never hard", rc == 0 and "[BDOI]" in out, f"got exit {rc}: {out}")
+rc, _ = run_main({"acm.bib": ACM}, "--strict", "--gate", reg=rescue)
+check("...and --strict turns soft findings into a failing gate", rc == 1, f"got exit {rc}")
+
+# 19b. The rescue bar is what stops a fabricated reference with a plausible title from being
+#      laundered into a warning. Lowering it from 0.90 to 0.60 passed every test, because
+#      the only non-matching fixture scored near zero. A title that merely CONTAINS the
+#      cited one sits at the containment ceiling, 0.85, inside that gap.
+cls, why = verify(Registry(search=["Attention Is All You Need: An Analysis Of The Valuation Of Art"]),
+                  doi="10.5555/3295222.3295349", title="Attention Is All You Need")
+check("a containment-only title match cannot rescue a dead DOI", cls == "FABRICATED", f"got {cls}: {why}")
 
 
 # 20. The identity bar must sit ABOVE the containment ceiling everywhere, or ordered
@@ -316,6 +462,614 @@ cls, why = H.verify({"doi": "10.1155/s1073792801000198", "arxiv": "", "year": ""
                      "title": "Pre-Lie algebras and the rooted trees operad", "key": "c"})
 check("an empty registry title is UNCHECKABLE, not MISMATCH", cls == "UNCHECKABLE", f"got {cls}: {why}")
 H._get = _real_get
+
+
+# --- round 5: audit 2026-09-28. The suite could not fail for most of what it guards ----
+#
+# A mutation pass planted 13 defects in hallucite.py, one at a time, and this suite passed
+# every one of them: the MISMATCH threshold dropped to 0.05, check_arxiv returning OK for
+# any id, the 429 retry deleted, arXiv extraction deleted, among others. The cases below
+# exist so that each of those now goes red. tests/mutants.py re-plants them in CI.
+
+# 23. THE POINT OF THE TOOL, and it had no offline test: a DOI that resolves to a different
+#     paper. Every MISMATCH assertion lived in the live --selftest, which CI never runs.
+cls, why = verify(NATURE, doi="10.1038/nature14539", title="Deep Learning")
+check("a resolving DOI with the cited title is OK", cls == "OK", f"got {cls}: {why}")
+cls, why = verify(NATURE, doi="10.1038/nature14539", title="Attention Is All You Need")
+check("a resolving DOI with a different title is MISMATCH", cls == "MISMATCH", f"got {cls}: {why}")
+
+# 24. Same, for a DOI outside Crossref (DataCite, Zenodo, arXiv DOIs), answered by doi.org.
+ZEN = Registry(doi_org={"10.5281/zenodo.1": {"title": "A Survey of Bird Songs"}})
+cls, why = verify(ZEN, doi="10.5281/zenodo.1", title="A Survey of Bird Songs")
+check("a non-Crossref DOI with the cited title is OK", cls == "OK", f"got {cls}: {why}")
+cls, why = verify(ZEN, doi="10.5281/zenodo.1", title="Attention Is All You Need")
+check("a non-Crossref DOI with a different title is MISMATCH", cls == "MISMATCH", f"got {cls}: {why}")
+
+# 25. arXiv had no offline test at all, so "every arXiv id is OK" passed the suite.
+ARX = Registry(arxiv={"1706.03762": "Attention Is All You Need"})
+cls, why = verify(ARX, arxiv="1706.03762", title="Attention is all you need")
+check("an arXiv id with the cited title is OK", cls == "OK", f"got {cls}: {why}")
+cls, why = verify(ARX, arxiv="1706.03762", title="Deep Residual Learning for Image Recognition")
+check("an arXiv id with a different title is MISMATCH", cls == "MISMATCH", f"got {cls}: {why}")
+cls, why = verify(ARX, arxiv="2101.99999", title="Attention Is All You Need")
+check("an arXiv id with no record is FABRICATED", cls == "FABRICATED", f"got {cls}: {why}")
+
+# 26. arXiv ids in \bibitem entries and in prose. Deleting either extractor passed.
+r = H.parse_bibitem(r"\bibitem{v} A. Vaswani, ``Attention is all you need,'' arXiv:1706.03762, 2017.")
+check("a \\bibitem arXiv id is extracted", r and r[0]["arxiv"] == "1706.03762", f"got {r}")
+r = H.parse_inline("as shown in arXiv:1706.03762v5 and elsewhere")
+check("an inline arXiv id is extracted", [x["arxiv"] for x in r] == ["1706.03762"], f"got {r}")
+
+# 27. 429 and 503 mean "come back later". Deleting the retry passed the suite, and without it
+#     a bibliography big enough to trip the rate limiter fails --gate for a reason that has
+#     nothing to do with its references.
+class _Resp:
+    status = 200
+
+    def read(self):
+        return b"{}"
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def _urlopen_script(*codes):
+    """urlopen that raises HTTPError for each code in turn, then succeeds."""
+    seen = []
+
+    def urlopen(req, timeout=None):
+        seen.append(req.full_url)
+        if len(seen) <= len(codes):
+            raise urllib.error.HTTPError(req.full_url, codes[len(seen) - 1], "x",
+                                         {"Retry-After": "0"}, None)
+        return _Resp()
+    return urlopen, seen
+
+
+real_urlopen, real_sleep = H.urllib.request.urlopen, H.time.sleep
+H.time.sleep = lambda s: None
+try:
+    H.urllib.request.urlopen, seen = _urlopen_script(429, 503)
+    body, status = H._get("https://api.crossref.org/works/10.1/x")
+    check("429 and 503 are retried", status == 200 and len(seen) == 3, f"{len(seen)} attempts")
+    H.urllib.request.urlopen, seen = _urlopen_script(404)
+    try:
+        H._get("https://api.crossref.org/works/10.1/x")
+        check("a 404 is not retried", False, "no exception raised")
+    except urllib.error.HTTPError as e:
+        check("a 404 is not retried", e.code == 404 and len(seen) == 1, f"{len(seen)} attempts")
+finally:
+    H.urllib.request.urlopen, H.time.sleep = real_urlopen, real_sleep
+
+# 28. The parser fixtures built into hallucite.py only ran under the live --selftest.
+check("the built-in parser fixtures pass offline", H.selftest_parsers())
+
+
+# --- round 6: a title the parser had to guess is evidence of nothing ------------------
+#
+# The network layer refuses to accuse on missing evidence. The parsers did not: a wrong
+# title guess went straight into the comparison, and a wrong title against a correct DOI
+# is a MISMATCH -- a hard failure on a correct reference. Found by audit 2026-09-28.
+
+# 29. The .bbl that BibTeX writes for natbib users. The venue sits in \emph{}, the title in
+#     the first \newblock, and the parser took the \emph{}: every reference with a DOI came
+#     back MISMATCH against "Nature" or "Proceedings of the IEEE Conference on ...".
+PLAINNAT = r"""\begin{thebibliography}{3}
+\bibitem[LeCun et~al.(2015)LeCun, Bengio, and Hinton]{lecun}
+Yann LeCun, Yoshua Bengio, and Geoffrey Hinton.
+\newblock Deep learning.
+\newblock \emph{Nature}, 521\penalty0 (7553):\penalty0 436--444, 2015.
+\newblock \doi{10.1038/nature14539}.
+
+\bibitem[He et~al.(2016)He, Zhang, Ren, and Sun]{he}
+Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun.
+\newblock Deep residual learning for image recognition.
+\newblock In \emph{Proceedings of the IEEE Conference on Computer Vision and Pattern
+  Recognition}, pages 770--778, 2016.
+\newblock \doi{10.1109/cvpr.2016.90}.
+
+\bibitem[Bishop(2006)]{bishop}
+Christopher~M. Bishop.
+\newblock \emph{Pattern Recognition and Machine Learning}.
+\newblock Springer, 2006.
+\end{thebibliography}"""
+refs = H.parse_bibitem(PLAINNAT)
+check("plainnat .bbl: titles come from the first \\newblock, not the \\emph{} venue",
+      [r["title"] for r in refs] == ["Deep learning", "Deep residual learning for image recognition",
+                                     "Pattern Recognition and Machine Learning"],
+      f"got {[r['title'] for r in refs]}")
+BBL_REG = Registry(crossref={"10.1038/nature14539": "Deep learning",
+                             "10.1109/cvpr.2016.90": "Deep Residual Learning for Image Recognition",
+                             "10.1103/physrevlett.88.057902":
+                             "Continuous Variable Quantum Cryptography Using Coherent States"})
+got = [verify(BBL_REG, **{k: r[k] for k in ("doi", "title", "title_guess")})[0] for r in refs[:2]]
+check("...and a correct plainnat .bbl is OK", got == ["OK", "OK"], f"got {got}")
+swapped = dict(refs[0], doi="10.1103/physrevlett.88.057902")
+cls, _ = verify(BBL_REG, **{k: swapped[k] for k in ("doi", "title", "title_guess")})
+check("...while a swapped DOI in it is still MISMATCH", cls == "MISMATCH", f"got {cls}")
+
+# 30. ACM and REVTeX .bbl files tag the title explicitly. REVTeX puts the JOURNAL in
+#     \emph{\bibinfo{journal}{...}}, which must not be guessed as a title either.
+r = H.parse_bibitem(r"\bibitem{a} \bibfield{author}{\bibinfo{person}{Y. LeCun}}."
+                    r" \newblock \bibinfo{title}{Deep learning}. \newblock"
+                    r" \bibinfo{journal}{\emph{Nature}} (2015).")
+check("\\bibinfo{title} is read", r and r[0]["title"] == "Deep learning", f"got {r and r[0]['title']!r}")
+r = H.parse_bibitem(r"\bibitem{a} \bibfield{author}{A. B.}, \emph{\bibinfo{journal}{Phys. Rev. Lett.}}"
+                    r" \textbf{\bibinfo{volume}{88}}, 057902 (2002)")
+check("REVTeX's \\emph{\\bibinfo{journal}} is not guessed as a title", r and r[0]["title"] == "",
+      f"got {r and r[0]['title']!r}")
+
+# 31. \" is an umlaut, not a quotation mark. `Schr\"odinger and G\"odel` parsed as the title
+#     `odinger and K.~G\`, which read MISMATCH against the paper's DOI.
+r = H.parse_bibitem(r"\bibitem{s} E.~Schr\"odinger and K.~G\"odel, Die gegenw\"artige Situation,"
+                    r" Naturwiss. 23, 807 (1935), doi:10.1007/bf01491891.")
+check("umlaut escapes are not read as quotes", r and "odinger" not in r[0]["title"],
+      f"got {r and r[0]['title']!r}")
+r = H.parse_bibitem(r'\bibitem{s} E.~Schr\"odinger, "Die gegenw\"artige Situation," Naturwiss. (1935).')
+check("...and a quoted title may contain one", r and r[0]["title"] == r'Die gegenw\"artige Situation',
+      f"got {r and r[0]['title']!r}")
+
+# 32. \emph{} holds the title in some styles and the journal in others, and nothing in the
+#     entry says which. A guess may raise SUSPECT; it must never raise MISMATCH.
+r = H.parse_bibitem(r"\bibitem{x} A. Author, \emph{Physical Review Letters} \textbf{88}, 057902 (2002),"
+                    r" doi:10.1103/physrevlett.88.057902.")
+check("an \\emph{} title is marked as a guess", r and r[0]["title_guess"], f"got {r}")
+PRL = Registry(crossref={"10.1103/physrevlett.88.057902":
+                         "Continuous Variable Quantum Cryptography Using Coherent States"})
+cls, why = verify(PRL, doi=r[0]["doi"], title=r[0]["title"], title_guess=True)
+check("a guessed title that disagrees is SUSPECT, not MISMATCH", cls == "SUSPECT", f"got {cls}: {why}")
+rc, out = run_main({"refs.tex": r"\begin{thebibliography}{1}" + "\n" + r"\bibitem{x} A. Author,"
+                    r" \emph{Physical Review Letters} \textbf{88}, 057902 (2002),"
+                    r" doi:10.1103/physrevlett.88.057902." + "\n" + r"\end{thebibliography}"},
+                   "--gate", reg=PRL)
+check("...so it does not fail the gate", rc == 0 and "[SUSP]" in out, f"got exit {rc}: {out}")
+
+# 33. BibTeX requires `{\"U}` in a quoted field precisely because a bare `\"` would end it.
+#     The field parser stopped at that `"` anyway: the title parsed as `{\`, scored 0.00,
+#     and a correct reference to Goedel's 1931 paper read MISMATCH.
+GODEL = "Über formal unentscheidbare Sätze der Principia Mathematica und verwandter Systeme I"
+r = H.parse_bib('@article{g, title = "{\\"U}ber formal unentscheidbare S{\\"a}tze der Principia '
+                'Mathematica und verwandter Systeme I", doi = {10.1007/BF01700692}}')
+check("a quoted field keeps going past a braced \\\"", r and r[0]["title"].endswith("Systeme I"),
+      f"got {r and r[0]['title']!r}")
+cls, why = verify(Registry(crossref={"10.1007/bf01700692": GODEL}), doi=r[0]["doi"], title=r[0]["title"])
+check("...and the reference is OK", cls == "OK", f"got {cls}: {why}")
+
+# 34. @string macros were never expanded, so `title = t1` was compared as the title "t1".
+r = H.parse_bib("@string{dl = {Deep learning}}\n@string{sub = dl # \": A Review\"}\n"
+                "@article{a, title = dl, doi = {10.1/a}}\n@article{b, title = sub}\n"
+                "@article{c, title = undefined_macro, doi = {10.1/c}}\n")
+check("@string macros are expanded, including # concatenation",
+      [x["title"] for x in r] == ["Deep learning", "Deep learning: A Review", ""],
+      f"got {[x['title'] for x in r]}")
+
+# 35. @article(key, ...) is legal BibTeX and was silently dropped from a mixed file. An `@`
+#     inside a field value must not open a phantom entry either.
+r = H.parse_bib('@article{a, title={One}}\n@article(b, title = "Two (and a half)", doi={10.9999/x})\n'
+                "@misc{c, title={Three}, note={mail me@home{} please}}\n")
+check("parenthesis-delimited entries are parsed",
+      [(x["key"], x["title"]) for x in r] == [("a", "One"), ("b", "Two (and a half)"), ("c", "Three")],
+      f"got {[(x['key'], x['title']) for x in r]}")
+
+# 36. A title with no comparable characters is no title. It scored 0.00 and read MISMATCH.
+cls, why = verify(NATURE, doi="10.1038/nature14539", title="{\\")
+check("a title that normalises to nothing is not compared", cls == "OK", f"got {cls}: {why}")
+
+
+# --- round 7: the arXiv path, where nothing had been ported ----------------------------
+#
+# Every guard added to the Crossref path -- a 200 that is not data is an outage, an id is
+# only an id where it is cited as one, a dead identifier is not a dead paper -- was missing
+# from the arXiv path. Found by audit 2026-09-28.
+
+# 37. An arXiv id is taken only where the text CITES one. The bibtex parser searched the whole
+#     entry for anything id-shaped whenever "arxiv" appeared in it: an IEEE Xplore URL gave
+#     document/8765432, a Zenodo URL record/1234567, and a real paper read FABRICATED.
+for label, entry in [
+        ("an IEEE Xplore URL", "url={https://ieeexplore.ieee.org/document/8765432}, note={on arXiv}"),
+        ("a Zenodo URL", "url={https://zenodo.org/record/1234567}, note={also on arXiv}"),
+        ("the digits of a DOI", "doi={10.1145/3292500.3330701}, note={arXiv version}"),
+        ("a non-arXiv eprint", "eprinttype={hdl}, eprint={1234.56789}, note={arXiv}")]:
+    r = H.parse_bib("@misc{a, title={X}, %s}" % entry)
+    check(f"{label} is not an arXiv id", r and r[0]["arxiv"] == "", f"got {r and r[0]['arxiv']!r}")
+for label, entry, want in [
+        ("eprint with prefix and version", "eprint={arXiv:1706.03762v5}", "1706.03762"),
+        ("archiveprefix + eprint", "archiveprefix={arXiv}, eprint={hep-th/9901001}", "hep-th/9901001"),
+        ("Google Scholar's journal field", "journal={arXiv preprint arXiv:1706.03762}", "1706.03762"),
+        ("an arxiv.org URL", "url={https://arxiv.org/abs/1706.03762}", "1706.03762"),
+        ("an arXiv DOI", "doi={10.48550/arXiv.1706.03762}", "1706.03762")]:
+    r = H.parse_bib("@misc{a, title={X}, %s}" % entry)
+    check(f"{label} gives the arXiv id", r and r[0]["arxiv"] == want, f"got {r and r[0]['arxiv']!r}")
+# Without digit boundaries a typo is truncated into a DIFFERENT, real id: arXiv:1706.037621
+# became 1706.03762, and the reference was then judged against somebody else's paper.
+for typo in ["arXiv:1706.037621", "arXiv:12345.6789"]:
+    got = H.parse_inline(typo)
+    check(f"a malformed id is not truncated into a real one ({typo})", got == [], f"got {got}")
+got = [x["arxiv"] for x in H.parse_inline("preprints: https://arxiv.org/abs/1706.03762v2 and "
+                                          "https://arxiv.org/pdf/1810.04805.pdf")]
+check("arxiv.org URLs in prose are references", got == ["1706.03762", "1810.04805"], f"got {got}")
+
+# 38. A 200 that is not an Atom feed is an outage. It carried no <entry>, which read as "no
+#     record", and a real paper came back FABRICATED while arXiv was showing a rate-limit page.
+cls, why = verify(Registry(arxiv_raw="<html><body>Rate exceeded.</body></html>"),
+                  arxiv="1706.03762", title="Attention Is All You Need")
+check("an arXiv 200 that is not a feed is UNCHECKABLE, not FABRICATED",
+      cls == "UNCHECKABLE" and H.NO_ORACLE in why, f"got {cls}: {why}")
+
+# 39. arXiv reports a malformed id as an entry titled "Error". Read as a record, an inline id
+#     with no title to compare -- the only kind prose has -- came back OK.
+ERR = ("<feed><entry><id>http://arxiv.org/api/errors#incorrect_id_format_for_2413.99999</id>"
+       "<title>Error</title><summary>incorrect id format for 2413.99999</summary></entry></feed>")
+cls, why = verify(Registry(arxiv_raw=ERR), arxiv="2413.99999")
+check("arXiv's error entry is not a record", cls == "FABRICATED", f"got {cls}: {why}")
+
+# 40. An empty feed is asked again once before it becomes an accusation, and every arXiv
+#     request goes over https (the old plain-http query let anyone on the path rewrite it).
+reg = Registry()
+verify(reg, arxiv="2101.99999")
+arx_calls = [u for u in reg.calls if "arxiv" in u]
+check("an empty arXiv answer is re-asked once", len(arx_calls) == 2, f"got {len(arx_calls)}")
+check("arXiv is queried over https", arx_calls and all(u.startswith("https://") for u in arx_calls),
+      f"got {arx_calls}")
+
+# 41. arXiv asks for one request every three seconds; everything was paced at 0.25 s.
+naps, real_sleep, real_mono = [], H.time.sleep, H.time.monotonic
+H.time.sleep, H.time.monotonic = naps.append, (lambda: 1000.0)
+H._arxiv_last[0] = 999.0
+real_get, H._get = H._get, (lambda url, accept=None: ("<feed></feed>", 200))
+try:
+    H._arxiv_get("id_list=1706.03762")
+finally:
+    H._get, H.time.sleep, H.time.monotonic = real_get, real_sleep, real_mono
+check("consecutive arXiv requests are three seconds apart", naps == [2.0], f"slept {naps}")
+
+# 42. The subject class of an old-style id is not part of it: math.AG/0512013 is math/0512013.
+cls, why = verify(Registry(arxiv={"math/0512013": "Some Algebraic Geometry"}),
+                  arxiv="math.AG/0512013", title="Some Algebraic Geometry")
+check("an old-style id with a subject class resolves", cls == "OK", f"got {cls}: {why}")
+
+# 43. A dead DOI next to a live arXiv id. The arXiv id was never asked, and a real preprint
+#     cited with a mistyped DOI came back FABRICATED with its own arXiv id in the entry.
+BERT = "BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding"
+ref = dict(doi="10.5555/1234567.7654321", arxiv="1810.04805", title=BERT)
+cls, why = verify(Registry(arxiv={"1810.04805": BERT}), **ref)
+check("a dead DOI with a live arXiv id is BAD-DOI", cls == "BAD-DOI", f"got {cls}: {why}")
+cls, why = verify(Registry(arxiv={}), **ref)
+check("...a dead DOI with a dead arXiv id is FABRICATED", cls == "FABRICATED", f"got {cls}: {why}")
+cls, why = verify(Registry(arxiv_raw="<html>down</html>"), **ref)
+check("...and with arXiv unreachable it is half a check", cls == "UNCHECKABLE" and H.NO_ORACLE in why,
+      f"got {cls}: {why}")
+
+# 44. The rescue asked only Crossref, which holds few of the conference papers that carry a
+#     dead ACM 10.5555 DOI. arXiv holds most of them. A mistyped arXiv id is rescued the
+#     same way a dead DOI is; it used to be FABRICATED with no title check at all.
+cls, why = verify(Registry(arxiv_search=[BERT]), doi="10.5555/1234567.7654321", title=BERT)
+check("a dead DOI whose title is on arXiv is BAD-DOI", cls == "BAD-DOI" and "arXiv match" in why,
+      f"got {cls}: {why}")
+cls, why = verify(Registry(arxiv_search=[BERT]), arxiv="1810.99999", title=BERT)
+check("a dead arXiv id whose title is real is BAD-DOI", cls == "BAD-DOI", f"got {cls}: {why}")
+cls, why = verify(Registry(arxiv_raw="<html>down</html>"), doi="10.5555/1234567.7654321", title=BERT)
+check("a rescue with one source down and no match is half a check",
+      cls == "UNCHECKABLE" and H.NO_ORACLE in why, f"got {cls}: {why}")
+
+# --- round 8: whether a DOI exists is asked of the DOI system, not of a redirect ------
+
+# 45. doi.org answers content negotiation by REDIRECTING, and for an agency with no
+#     metadata service the redirect lands on the publisher's page. urllib follows it, so a
+#     publisher's 404 on a moved page read as "does not resolve at doi.org (all
+#     registration agencies)": a REGISTERED DOI came back FABRICATED. Existence now comes
+#     from the Handle API. What the landing page does is a metadata gap, soft, permanent.
+for label, page in [("a publisher 404 on the landing page", 404),
+                    ("a publisher bot wall", 403),
+                    ("an agency with no metadata service", "<html>Landing page</html>")]:
+    reg = Registry(landing={"10.1234/x": page})
+    cls, why = verify(reg, doi="10.1234/x", title="A Real Report")
+    check(f"registered DOI, {label}: not FABRICATED, not a gate failure",
+          cls == "UNCHECKABLE" and why.startswith(H.NO_TITLE), f"got {cls}: {why}")
+rc, out = run_main({"r.bib": "@techreport{r, title={A Real Report}, doi={10.1234/x}}\n"}, "--gate",
+                   reg=Registry(landing={"10.1234/x": 404}))
+check("...and --gate passes on it rather than failing forever", rc == 0, f"got exit {rc}: {out}")
+
+# 46. The Handle API's own answers. 404 (and responseCode 100 on a 200) is "not registered";
+#     anything unreadable is an outage, never an accusation.
+cls, why = verify(Registry(), doi="10.9999/nope", title="Quantum Wombat Onomastics")
+check("an unregistered DOI with an unknown title is FABRICATED", cls == "FABRICATED", f"got {cls}: {why}")
+cls, why = verify(Registry(handle_raw=(200, '{"responseCode": 100}')), doi="10.9999/nope",
+                  title="Quantum Wombat Onomastics")
+check("responseCode 100 is 'not registered'", cls == "FABRICATED", f"got {cls}: {why}")
+for label, raw in [("a 503", (503, "")), ("a 200 that is not JSON", (200, "<html>maintenance</html>")),
+                   ("an unexpected responseCode", (200, '{"responseCode": 2}'))]:
+    cls, why = verify(Registry(handle_raw=raw), doi="10.9999/nope", title="Quantum Wombat Onomastics")
+    check(f"Handle API {label} is an outage", cls == "UNCHECKABLE" and H.NO_ORACLE in why,
+          f"got {cls}: {why}")
+
+# 47. The empty-title guard reached the Crossref path only. A DataCite record with no title
+#     scored 0.00 against the cited one and read MISMATCH.
+for empty in ["", []]:
+    cls, why = verify(Registry(doi_org={"10.5281/zenodo.2": {"title": empty}}),
+                      doi="10.5281/zenodo.2", title="My dataset v1.2")
+    check(f"an empty non-Crossref title ({empty!r}) is UNCHECKABLE, not MISMATCH",
+          cls == "UNCHECKABLE" and why.startswith(H.NO_TITLE), f"got {cls}: {why}")
+
+# 48. A `..` path segment is resolved by the server before the lookup, so a crafted DOI
+#     could be answered with the record of a different, real DOI. It is not sent at all.
+reg = Registry(crossref={"10.1038/nature14539": "Deep learning"})
+cls, why = verify(reg, doi="10.1234/../../works/10.1038/nature14539", title="Deep learning")
+check("a DOI with a '..' segment is not sent", cls == "UNCHECKABLE" and not reg.calls,
+      f"got {cls}: {why}; calls {reg.calls}")
+check("...and it fails the gate like any check that did not run", H.NO_ORACLE in why, why)
+
+# --- round 9: a DOI is read the way people write it ---------------------------------
+
+# 49. Only a `https://doi.org/` prefix was stripped from a doi field; every other common form
+#     went to the registry as written, 404ed, and a real paper was FABRICATED unless its
+#     title was rescued. Found by audit 2026-09-28.
+for form in ["https://doi.org/10.1038/nature14539", "http://dx.doi.org/10.1038/nature14539",
+             "https://dx.doi.org/10.1038/nature14539", "http://doi.org/10.1038/nature14539",
+             "doi:10.1038/nature14539", "DOI: 10.1038/NATURE14539", "  10.1038/nature14539. "]:
+    r = H.parse_bib("@article{a, title={Deep learning}, doi={%s}}" % form)
+    check(f"doi field {form.strip()!r} is read", r and r[0]["doi"] == "10.1038/nature14539",
+          f"got {r and r[0]['doi']!r}")
+r = H.parse_bib("@article{a, title={Deep learning}, doi={http://dx.doi.org/10.1038/nature14539}}")[0]
+cls, why = verify(NATURE, **{k: r[k] for k in ("doi", "title")})
+check("...and such a reference is OK", cls == "OK", f"got {cls}: {why}")
+
+# 50. `_` must be escaped in LaTeX text and Mendeley escapes it in .bib fields, so the TACL
+#     DOI 10.1162/tacl_a_00349 arrived as `tacl\_a\_00349`: sent with its backslashes from
+#     bibtex, cut at the first one inline. Both 404ed.
+TACL = "10.1162/tacl_a_00349"
+for label, got in [
+        ("bibtex \\_", H.parse_bib(r"@article{a, title={X}, doi={10.1162/tacl\_a\_00349}}")),
+        ("bibtex {\\_}", H.parse_bib(r"@article{a, title={X}, doi={10.1162/tacl{\_}a{\_}00349}}")),
+        ("bibtex \\textunderscore", H.parse_bib(r"@article{a, title={X}, doi={10.1162/tacl\textunderscore a\textunderscore 00349}}")),
+        ("\\bibitem", H.parse_bibitem(r"\bibitem{a} A. Rogers, ``A Primer in BERTology,'' TACL, doi:10.1162/tacl\_a\_00349.")),
+        ("inline .tex", H.parse_inline(r"see doi:10.1162/tacl\_a\_00349 for details"))]:
+    check(f"escaped underscores in a DOI ({label})", got and got[0]["doi"] == TACL,
+          f"got {got and got[0]['doi']!r}")
+TACL_REG = Registry(crossref={TACL: "A Primer in BERTology: What We Know About How BERT Works"})
+r = H.parse_bib(r"@article{a, title={A Primer in {BERT}ology: What We Know About How {BERT} Works},"
+                r" doi={10.1162/tacl\_a\_00349}}")[0]
+cls, why = verify(TACL_REG, **{k: r[k] for k in ("doi", "title")})
+check("...and the TACL reference is OK, not FABRICATED", cls == "OK", f"got {cls}: {why}")
+
+# 51. A doi field with no DOI in it does not hide one elsewhere in the entry.
+r = H.parse_bib("@misc{a, title={X}, doi={n/a}, note={https://doi.org/10.1098/rspa.2020.0063}}")
+check("a doi field without a DOI falls back to the entry", r and r[0]["doi"] == "10.1098/rspa.2020.0063",
+      f"got {r and r[0]['doi']!r}")
+
+# --- round 10: what a file cites, and what "OK" means -----------------------------------
+
+# 52. The citation-marker check knew `\cite{`, `\bibitem`, `@article` and `@inproceedings`.
+#     A natbib paper run without its .bib printed "no citation markers" and PASSED --gate,
+#     where a hard parser failure is promised. Found by audit 2026-09-28.
+for cmd in [r"\citep{a}", r"\citet{a}", r"\cite[p.~3]{a}", r"\parencite{a}", r"\autocite{a}",
+            r"\textcite{a}", r"\footcite[see][12]{a}", r"\citeauthor*{a}", r"\bibliography{refs}"]:
+    rc, out = run_main({"paper.tex": "\\begin{document}As shown " + cmd + ".\\end{document}\n"}, "--gate")
+    check(f"{cmd} is a citation: alone, it fails the gate", rc == 1 and "PARSER FAILURE" in out,
+          f"got exit {rc}: {out.strip()[:80]}")
+rc, out = run_main({"notes.md": "Write to me@example.com (any time). Twitter: @someone(ish).\n"}, "--gate")
+check("...while prose with an @ is not a bibliography", rc == 0, f"got exit {rc}: {out}")
+
+# 53. One parser per file dropped every reference the chosen parser could not see: a
+#     markdown page quoting one BibTeX entry was parsed as BibTeX only. And the BibTeX
+#     trigger was case-sensitive, so `@ARTICLE` in a file not named .bib was read as prose.
+MD = ("# Related work\nDeep nets (https://doi.org/10.1038/nature14539) and a made-up one\n"
+      "(https://doi.org/10.9999/fake.123). Cite this repo as:\n\n"
+      "@ARTICLE{us, title={Our Tool}, doi={10.5555/ours}}\n")
+got = sorted(r["doi"] for r in H.parse_file("notes.md", MD))
+check("a file mixing BibTeX and prose loses neither",
+      got == ["10.1038/nature14539", "10.5555/ours", "10.9999/fake.123"], f"got {got}")
+# The inline pass would find the entry's DOI either way; only a BibTeX read keeps its title,
+# and without a title a DOI pointing at the wrong paper passes.
+got = [(r["key"], r["title"]) for r in H.parse_file("notes.md", MD) if r["doi"] == "10.5555/ours"]
+check("...and @ARTICLE is read as BibTeX, title and all", got == [("us", "Our Tool")], f"got {got}")
+TEX_MIXED = (PLAINNAT.replace(r"\end{thebibliography}", "") +
+             "\n\\end{thebibliography}\nData: https://doi.org/10.5281/zenodo.1 and doi:10.1038/nature14539\n")
+got = [(r["type"], r["doi"]) for r in H.parse_file("paper.tex", TEX_MIXED)]
+check("\\bibitem entries plus identifiers they do not already cover, without duplicates",
+      got.count(("bibitem", "10.1038/nature14539")) == 1 and ("inline-doi", "10.5281/zenodo.1") in got
+      and ("inline-doi", "10.1038/nature14539") not in got, f"got {got}")
+
+# 54. With no cited title, "OK" means the identifier exists, not that it is the paper cited:
+#     a DOI pointing at a different paper passes. Markdown and bare .tex give nothing else.
+#     It is said on the line and in the summary now.
+rc, out = run_main({"paper.md": "Attention is all you need. https://doi.org/10.1038/nature14539\n"},
+                   reg=NATURE)
+check("an identifier-only pass says so", "[identifier only" in out and "passed on the identifier alone" in out,
+      f"got {out}")
+rc, out = run_main({"r.bib": BIB}, reg=NATURE)
+check("...and a titled pass does not", "identifier" not in out, f"got {out}")
+
+# --- round 11: scoring a title the way it is actually written ---------------------------
+#
+# The 0.60 bar decides MISMATCH, but the 0.90 bar decides whether a real paper with a dead
+# DOI is rescued or FABRICATED, and whether a title-only reference clears. Ordinary
+# differences between a bibliography and a registry kept real titles below 0.90. None of
+# them could show up in the benchmark, which copies the registry's title verbatim. Found
+# by audit 2026-09-28.
+
+# 55. difflib's autojunk treats every character making up >1% of a 200+ character sequence
+#     as junk: for a long joined title, the space and most vowels. A one-word edit to a
+#     250-character title scored 0.54 on the string ratio.
+LONG = ("Efficacy and safety of a novel once-weekly subcutaneous formulation compared with daily "
+        "oral therapy in adults with moderate to severe chronic kidney disease and type 2 diabetes: "
+        "a randomised, double-blind, placebo-controlled, multicentre phase 3 trial")
+got = H.title_match(LONG.replace("novel", "new"), LONG)
+check("a one-word edit to a long title still certifies identity", got >= 0.90, f"got {got:.2f}")
+
+# 56. Registry markup against TeX. Crossref writes CO<sub>2</sub>, <i>α</i>, whole MathML
+#     trees and HTML entities; a bibliography writes CO$_2$ and $\alpha$.
+for cited, registry_title in [
+        ("Photocatalytic CO$_2$ reduction", "Photocatalytic CO<sub>2</sub> reduction"),
+        ("The $\\alpha$-helix revisited", "The <i>α</i>-helix revisited"),
+        ("E. coli growth kinetics", "<jats:italic>E. coli</jats:italic> growth kinetics"),
+        ("Fe$_3$O$_4$ nanoparticles", '<mml:math xmlns:mml="http://www.w3.org/1998/Math/MathML">'
+         "<mml:msub><mml:mi>Fe</mml:mi><mml:mn>3</mml:mn></mml:msub><mml:msub><mml:mi>O</mml:mi>"
+         "<mml:mn>4</mml:mn></mml:msub></mml:math> nanoparticles"),
+        ("Research \\& development", "Research &amp; development")]:
+    got = H.title_match(cited, registry_title)
+    check(f"TeX {cited[:22]!r} matches registry markup", got >= 0.90, f"got {got:.2f}")
+    # The score forgives one stray space ("co 2" vs "co2"); the tokens are the property.
+    check(f"...and folds to the same words", H.norm(cited) == H.norm(registry_title),
+          f"{H.norm(cited)} vs {H.norm(registry_title)}")
+
+# 57. TeX letters and grouping. {\o}, {\ss}, {\L} and the dotless \i of `\'{\i}` matched no
+#     accent pattern and shattered their words; braces became spaces, so the case
+#     protection in {BERT}ology split the word in two.
+for cited, plain in [(r"F\'{\i}sica cu\'{a}ntica", "Física cuántica"),
+                     (r"Bj{\o}rn's l{\ae}rebog", "Bjørn's lærebog"),
+                     (r"Stra{\ss}enbahn", "Straßenbahn"),
+                     (r"{\L}ukasiewicz logic", "Łukasiewicz logic"),
+                     (r"A Primer in {BERT}ology", "A Primer in BERTology"),
+                     (r"\emph{In vivo} imaging", "In vivo imaging")]:
+    got = H.title_match(cited, plain)
+    check(f"TeX {cited[:22]!r} matches its plain text", got >= 0.90, f"got {got:.2f}")
+    check(f"...and folds to the same words", H.norm(cited) == H.norm(plain),
+          f"{H.norm(cited)} vs {H.norm(plain)}")
+check("...and the fold still does not make everything match",
+      H.title_match(r"Bj{\o}rn's l{\ae}rebog", "Continuous Variable Quantum Cryptography") < 0.60)
+
+# 58. Crossref splits "Title: Subtitle" across two fields, and keeps an original-language
+#     title apart. Only title[0] was read, so a reference citing the full title scored 0.85
+#     against the bare one: below the rescue bar, so a real paper with a dead DOI read
+#     FABRICATED.
+REC = {"title": ["Deep Residual Learning for Image Recognition"], "subtitle": ["A Retrospective"]}
+FULL = "Deep Residual Learning for Image Recognition: A Retrospective"
+cls, why = verify(Registry(search=[REC]), doi="10.5555/dead.1", title=FULL)
+check("a dead DOI cited with the registry's subtitle is rescued", cls == "BAD-DOI", f"got {cls}: {why}")
+cls, why = verify(Registry(crossref={"10.1/sub": REC}), doi="10.1/sub", title=FULL)
+check("...and a live one matches in full", cls == "OK" and "1.00" in why, f"got {cls}: {why}")
+cls, why = verify(Registry(crossref={"10.1/orig": {"title": ["Quantum cryptography"],
+                                                   "original-title": ["Квантовая криптография"]}}),
+                  doi="10.1/orig", title="Квантовая криптография")
+check("a paper cited by its original-language title is OK", cls == "OK", f"got {cls}: {why}")
+cls, why = verify(Registry(search=[{"title": ["Bidirectional Encoders"], "short-title": ["BERT"]}]),
+                  doi="10.5555/dead.2", title="BERT")
+check("...but a short title cannot certify identity", cls == "FABRICATED", f"got {cls}: {why}")
+
+# --- round 12: nothing a registry or a terminal does may crash the run ------------------
+
+# 59. A 200 with JSON that is not the expected object raised AttributeError out of
+#     check_doi: a traceback, exit 1, and the report of every other reference lost.
+for body, paths in [('["unexpected"]', ("doi", "title")), ('"maintenance"', ("doi", "title")),
+                    ('{"message": ["x"]}', ("doi", "title")), ('{"message": {"items": "x"}}', ("title",))]:
+    got, crashed = [], None
+    try:
+        with registry(lambda u, accept=None, b=body: (b, 200)):
+            if "doi" in paths:
+                got.append(H.verify({"doi": "10.1/x", "arxiv": "", "title": "T", "year": "", "key": "k"}))
+            got.append(H.verify({"doi": "", "arxiv": "", "title": "Some Title", "year": "", "key": "k"}))
+    except Exception as e:  # noqa: BLE001
+        crashed = e
+    check(f"registry JSON {body} is an outage, not a crash",
+          crashed is None and all(c == "UNCHECKABLE" and H.NO_ORACLE in w for c, w in got),
+          f"crashed with {crashed!r}" if crashed else f"got {got}")
+
+# 60. One reference's bug must not take the report of every other one with it. It still
+#     fails the gate: a check that did not run is not a pass.
+real_check_doi = H.check_doi
+H.check_doi = lambda doi, title: (_ for _ in ()).throw(RuntimeError("boom")) if doi == "10.1234/boom" \
+    else real_check_doi(doi, title)
+try:
+    rc, out = run_main({"r.bib": "@article{a, title={X}, doi={10.1234/boom}}\n" + BIB}, "--gate", reg=NATURE)
+finally:
+    H.check_doi = real_check_doi
+check("an internal error on one reference is reported and the run goes on",
+      rc == 1 and "internal error" in out and "RuntimeError: boom" in out and "[ ok ] lecun" in out,
+      f"got exit {rc}: {out}")
+
+# 61. Where stdout is not UTF-8 -- Windows when output is piped -- printing a title in
+#     another script raised UnicodeEncodeError and killed the run. A file name will do.
+with tempfile.TemporaryDirectory() as d:
+    jp = pathlib.Path(d, "量子計算.bib")
+    jp.write_text("% no entries\n", encoding="utf-8")
+    p = subprocess.run([sys.executable, HAL, str(jp)], capture_output=True,
+                       env=dict(os.environ, PYTHONIOENCODING="cp1252"))
+check("a non-UTF-8 stdout does not crash the run", p.returncode == 0,
+      f"got exit {p.returncode}: {p.stderr[-200:]!r}")
+
+# 62. Only 429 and 503 were retried; one timeout made a reference UNVERIFIED and failed the
+#     gate. A refused connection is not transient in the same way and is not retried.
+def _urlopen_raising(*errors):
+    seen = []
+
+    def urlopen(req, timeout=None):
+        seen.append(req.full_url)
+        if len(seen) <= len(errors):
+            raise errors[len(seen) - 1]
+        return _Resp()
+    return urlopen, seen
+
+
+real_urlopen = H.urllib.request.urlopen
+try:
+    for label, err in [("a timeout", urllib.error.URLError(TimeoutError("timed out"))),
+                       ("a read timeout", TimeoutError("timed out")),
+                       ("a reset connection", ConnectionResetError("reset"))]:
+        H.urllib.request.urlopen, seen = _urlopen_raising(err)
+        body, status = H._get("https://api.crossref.org/works/10.1/x")
+        check(f"{label} is retried", status == 200 and len(seen) == 2, f"{len(seen)} attempts")
+    H.urllib.request.urlopen, seen = _urlopen_raising(urllib.error.URLError(ConnectionRefusedError()))
+    try:
+        H._get("https://api.crossref.org/works/10.1/x")
+        check("a refused connection is not retried", False, "no exception")
+    except urllib.error.URLError:
+        check("a refused connection is not retried", len(seen) == 1, f"{len(seen)} attempts")
+finally:
+    H.urllib.request.urlopen = real_urlopen
+
+# 63. The polite-pool address went into the URL unencoded, so a `+` alias read as a space.
+real_mailto = H.MAILTO
+H.MAILTO = "me+hallucite@example.org"
+try:
+    reg = Registry(crossref={"10.1038/nature14539": "Deep learning"})
+    verify(reg, doi="10.1038/nature14539", title="Deep learning")
+finally:
+    H.MAILTO = real_mailto
+check("the polite-pool address is URL-encoded", reg.calls and "mailto=me%2Bhallucite%40example.org" in reg.calls[0],
+      f"got {reg.calls}")
+
+# --- round 13: the benchmark's own machinery, offline ---------------------------------
+#
+# 64. bench/ only measures anything against live Crossref, so nothing ran it and nothing would
+#     notice it rotting. build.py itself is offline: build every arm from a small synthetic
+#     manifest -- registry markup, a separate subtitle, TeX letters -- and hold the verifier to
+#     what each arm promises. The deformed, rescue and .bbl arms were added 2026-09-28 because
+#     the original three could not produce any of the false accusations the audit found.
+WORKS = [
+    {"doi": "10.1021/jacs.0c01234", "subtitle": "a mechanistic study", "venue": "J. Am. Chem. Soc.",
+     "title": "Photocatalytic CO<sub>2</sub> reduction on Fe<sub>3</sub>O<sub>4</sub>", "year": 2020},
+    {"doi": "10.1016/j.cell.2019.01.001", "subtitle": "", "venue": "Cell",
+     "title": "<i>In vivo</i> imaging of the <i>α</i>-helix", "year": 2019},
+    {"doi": "10.1007/978-3-030-12345-6_7", "subtitle": "Łukasiewicz revisited", "venue": "LNCS",
+     "title": "Física cuántica y Straße: Bjørn's lærebog", "year": 2021},
+    {"doi": "10.1103/physrevlett.88.057902", "subtitle": "", "venue": "Phys. Rev. Lett.",
+     "title": "Continuous Variable Quantum Cryptography Using Coherent States", "year": 2002},
+]
+RECORDS = {w["doi"]: {"title": [w["title"]], **({"subtitle": [w["subtitle"]]} if w["subtitle"] else {})}
+           for w in WORKS}
+BENCH_REG = Registry(crossref=RECORDS, search=list(RECORDS.values()))
+with tempfile.TemporaryDirectory() as d:
+    man = pathlib.Path(d, "manifest.json")
+    man.write_text(json.dumps([dict(w, type="journal-article", original_title="") for w in WORKS]))
+    built = subprocess.run([sys.executable, str(pathlib.Path(HAL).parent / "bench" / "build.py"), str(man), d],
+                           capture_output=True, text=True)
+    check("bench/build.py builds every arm", built.returncode == 0, built.stderr[-300:])
+    arms = {n: pathlib.Path(d, n).read_text() for n in
+            ("raw.bib", "perturbed.bib", "deformed.bib", "rescue.bib", "control.bib", "raw.bbl")
+            if pathlib.Path(d, n).exists()}
+for name in ("raw.bib", "perturbed.bib", "deformed.bib", "raw.bbl"):
+    rc, out = run_main({name: arms.get(name, "")}, "--gate", reg=BENCH_REG)
+    check(f"bench arm {name}: real works, no hard finding", rc == 0 and "[ ok ]" in out,
+          f"got exit {rc}: {out}")
+rc, out = run_main({"rescue.bib": arms.get("rescue.bib", "")}, reg=BENCH_REG)
+check("bench arm rescue.bib: every deformed real title is rescued",
+      out.count("[BDOI]") == len(WORKS), f"got: {out}")
+rc, out = run_main({"control.bib": arms.get("control.bib", "")}, "--gate", reg=BENCH_REG)
+check("bench arm control.bib: the run can fail", rc == 1 and "[FABR]" in out, f"got exit {rc}")
 
 print(f"\n{'ALL PASS' if not FAILS else str(len(FAILS)) + ' FAILED: ' + ', '.join(FAILS)}")
 sys.exit(0 if not FAILS else 1)

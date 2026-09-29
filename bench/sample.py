@@ -6,6 +6,12 @@ and the title is the registry's own. The correct output of a citation verifier o
 is therefore zero FABRICATED and zero MISMATCH, and every hit is a false accusation with a
 diagnosis attached. Sampling is via Crossref's `sample=` parameter, which is not seedable,
 so the drawn DOIs are recorded in the manifest to make the run reproducible.
+
+The 2026-09-02 run also filtered on `has-full-text:false`, which keeps only records with no
+full-text link and so likely under-samples the large publishers that deposit them. Nothing
+said so. The filter is gone; the published numbers were measured with it (bench/README.md).
+Subtitle, original-language title and venue are recorded because build.py now deforms the
+cited title the way real bibliographies do, and a .bbl needs a venue.
 """
 import json, sys, time, urllib.request, urllib.parse
 
@@ -33,7 +39,7 @@ def get(url):
 out = []
 for lo, hi, typ, n in STRATA:
     url = ("https://api.crossref.org/works?"
-           f"filter=from-pub-date:{lo},until-pub-date:{hi},type:{typ},has-full-text:false"
+           f"filter=from-pub-date:{lo},until-pub-date:{hi},type:{typ}"
            f"&sample={n}")
     try:
         j = get(url)
@@ -45,6 +51,9 @@ for lo, hi, typ, n in STRATA:
         if not t or len(t) < 4:
             continue                      # no title in the record: nothing to compare
         out.append({"doi": it["DOI"], "title": t, "type": typ,
+                    "subtitle": (it.get("subtitle") or [""])[0],
+                    "original_title": (it.get("original-title") or [""])[0],
+                    "venue": (it.get("container-title") or [""])[0],
                     "year": (it.get("issued", {}).get("date-parts") or [[None]])[0][0]})
         got += 1
     print(f"  {typ:20s} {lo[:4]}-{hi[:4]}: {got}", file=sys.stderr)
